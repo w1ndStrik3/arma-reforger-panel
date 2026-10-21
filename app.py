@@ -136,8 +136,16 @@ app.config.update(
 # ─── SECURITY HELPERS ─────────────────────────────────────────────────────────
 
 def _client_ip():
-    # Honor X-Forwarded-For only when behind a reverse proxy; otherwise use remote_addr
-    return request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip() or "unknown"
+    # X-Forwarded-For is only believable when a reverse proxy on this machine
+    # (Caddy, nginx, tailscale serve/funnel) added it; from anyone else it's
+    # whatever the client chose to send. Proxies append the address they saw,
+    # so the last entry is the real one; earlier entries can be forged.
+    remote = request.remote_addr or ""
+    if remote in ("127.0.0.1", "::1"):
+        forwarded = request.headers.get("X-Forwarded-For", "").split(",")[-1].strip()
+        if forwarded:
+            return forwarded
+    return remote or "unknown"
 
 
 _LOGIN_BUCKETS: dict[str, list[float]] = {}

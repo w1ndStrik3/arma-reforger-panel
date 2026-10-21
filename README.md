@@ -187,6 +187,7 @@ location / {
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_buffering off;
     proxy_read_timeout 3600;
@@ -223,7 +224,19 @@ To keep Caddy running after reboots, register it as a service with [NSSM](https:
 
 ### Without a domain: Tailscale
 
-If only you and a few admins use the panel, [Tailscale](https://tailscale.com/) is simpler: install it on the server and on your devices, then open `http://<server's Tailscale IP>:8888`. Traffic between your devices is encrypted by Tailscale, and you can remove the panel's firewall rule so it isn't reachable from the internet at all. Leave `SECURE_COOKIES` off in this case: the panel itself still speaks plain HTTP inside the encrypted tunnel.
+[Tailscale](https://tailscale.com/) can put the panel behind HTTPS on a free `https://<machine>.<tailnet>.ts.net` address with a real certificate. Install Tailscale on the server, then in the [admin console](https://login.tailscale.com/admin/dns) enable **MagicDNS** and **HTTPS Certificates**. Set `PANEL_HOST=127.0.0.1` and `SECURE_COOKIES=true` in `config.env`, restart the panel and remove the panel's firewall rule (`Remove-NetFirewallRule -DisplayName "Arma Panel"`). Then pick one:
+
+- **Private** — only devices signed in to your Tailscale account can open it:
+  ```powershell
+  tailscale serve --bg 8888
+  ```
+- **Public** — anyone can open it from any browser, no Tailscale needed on their side. Funnel must be allowed for the machine in the Tailscale admin console (the command tells you if it isn't):
+  ```powershell
+  tailscale funnel --bg 8888
+  ```
+  The panel password is then the only thing between the internet and your server, so make it long and unique.
+
+`tailscale serve status` / `tailscale funnel status` shows the address; `tailscale funnel --https=443 off` (or `tailscale serve --https=443 off`) stops it.
 
 ---
 
