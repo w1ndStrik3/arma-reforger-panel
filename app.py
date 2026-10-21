@@ -62,6 +62,11 @@ if not PANEL_PASSWORD_HASH:
 _WIN_GAME_HOME = os.path.join(os.path.expanduser("~"), "Documents", "My Games", "ArmaReforger")
 
 PANEL_PORT     = int(_cfg.get("PANEL_PORT", 8888))
+# 127.0.0.1 = reachable only through a reverse proxy on the same machine.
+PANEL_HOST     = _cfg.get("PANEL_HOST", "0.0.0.0")
+# Set when the panel is served over HTTPS, so the browser never sends the
+# session cookie over plain HTTP.
+SECURE_COOKIES = _cfg.get("SECURE_COOKIES", "").strip().lower() in ("1", "true", "yes")
 if IS_WINDOWS:
     SERVER_DIR    = _cfg.get("SERVER_DIR",    r"C:\arma\server")
     SERVER_CONFIG = _cfg.get("SERVER_CONFIG", os.path.join(SERVER_DIR, "config.json"))
@@ -122,7 +127,7 @@ app.secret_key = _load_or_create_secret()
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax',
-    SESSION_COOKIE_SECURE=False,  # set True if you put HTTPS in front
+    SESSION_COOKIE_SECURE=SECURE_COOKIES,
     PERMANENT_SESSION_LIFETIME=60 * 60 * 12,
     MAX_CONTENT_LENGTH=2 * 1024 * 1024,  # 2 MB cap on uploads
 )
@@ -1354,4 +1359,4 @@ def api_soft_restart():
     return _begin_lifecycle("soft-restart", require_running=True)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PANEL_PORT, threaded=True)
+    app.run(host=PANEL_HOST, port=PANEL_PORT, threaded=True)

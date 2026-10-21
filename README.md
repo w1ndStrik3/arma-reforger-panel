@@ -195,6 +195,36 @@ location / {
 
 If you use **HestiaCP**, add a subdomain through its web interface — it handles SSL automatically.
 
+Whichever proxy you use, set these in `config.env` and restart the panel:
+```env
+PANEL_HOST=127.0.0.1     # the unencrypted port is no longer reachable from outside
+SECURE_COOKIES=true      # the session cookie is only ever sent over HTTPS
+```
+
+### HTTPS on Windows with Caddy
+
+[Caddy](https://caddyserver.com/) gets and renews a Let's Encrypt certificate by itself. You need a domain (or subdomain) whose DNS A record points at the server's public IP.
+
+1. Download `caddy_windows_amd64.exe` from [caddyserver.com/download](https://caddyserver.com/download), rename it to `caddy.exe` and put it in e.g. `C:\caddy`.
+2. Create `C:\caddy\Caddyfile`:
+   ```
+   panel.example.com {
+       reverse_proxy 127.0.0.1:8888
+   }
+   ```
+3. Open ports 80 and 443 (needed for the certificate) and close the panel port:
+   ```powershell
+   New-NetFirewallRule -DisplayName "Caddy" -Direction Inbound -Protocol TCP -LocalPort 80,443 -Action Allow
+   Remove-NetFirewallRule -DisplayName "Arma Panel"
+   ```
+4. Set `PANEL_HOST=127.0.0.1` and `SECURE_COOKIES=true` in `config.env`, restart the panel, then run `caddy run` in `C:\caddy`. Open `https://panel.example.com`.
+
+To keep Caddy running after reboots, register it as a service with [NSSM](https://nssm.cc/): `nssm install caddy C:\caddy\caddy.exe run --config C:\caddy\Caddyfile`.
+
+### Without a domain: Tailscale
+
+If only you and a few admins use the panel, [Tailscale](https://tailscale.com/) is simpler: install it on the server and on your devices, then open `http://<server's Tailscale IP>:8888`. Traffic between your devices is encrypted by Tailscale, and you can remove the panel's firewall rule so it isn't reachable from the internet at all. Leave `SECURE_COOKIES` off in this case: the panel itself still speaks plain HTTP inside the encrypted tunnel.
+
 ---
 
 ## Project Structure
