@@ -10,6 +10,8 @@ A lightweight, self-hosted web panel for managing your **Arma Reforger dedicated
 
 - **One-command install** — sets up SteamCMD, downloads the Arma Reforger server and installs the panel automatically
 - **Server control** — Start, stop and restart your server from the browser
+- **Soft restart** — Save the game state, stop the server and bring it back up from that save
+- **Linux and Windows** — Runs on Ubuntu (with the installer) or on Windows Server (manual setup)
 - **Real-time monitoring** — Live CPU and RAM charts updated every 3 seconds
 - **Live log streaming** — Server console logs with colour-coded output (errors, warnings, network events)
 - **Mission selector** — 41 built-in missions including all vanilla and RHS — Status Quo scenarios
@@ -71,7 +73,43 @@ The installer will ask for your existing server paths (`SERVER_DIR`, `config.jso
 
 ---
 
-### Option C — Update panel files only
+### Option C — Windows Server
+
+There is no installer for Windows; setup takes a few manual steps.
+
+1. Install the server with [SteamCMD for Windows](https://developer.valvesoftware.com/wiki/SteamCMD#Windows):
+   ```powershell
+   steamcmd +force_install_dir C:\arma\server +login anonymous +app_update 1874900 validate +quit
+   ```
+2. Install [Python 3.10+](https://www.python.org/downloads/windows/) (tick **Add python.exe to PATH**), then in the panel folder:
+   ```powershell
+   pip install -r requirements.txt
+   copy config.env.example config.env
+   ```
+3. Edit `config.env` with Windows paths, for example:
+   ```env
+   PANEL_PASSWORD=your-password
+   SERVER_DIR=C:\arma\server
+   SERVER_CONFIG=C:\arma\server\config.json
+   LOG_DIR=C:\Users\Administrator\Documents\My Games\ArmaReforger\logs
+   WORKSHOP_DIR=C:\Users\Administrator\Documents\My Games\ArmaReforger\addons
+   PROFILE_DIR=C:\Users\Administrator\Documents\My Games\ArmaReforger\profile
+   ```
+   The `Documents\My Games\ArmaReforger` paths belong to the Windows user the server runs as. A plaintext `PANEL_PASSWORD` works but prints a warning; see `config.env.example` for setting a bcrypt hash instead.
+4. Open the ports (PowerShell as Administrator):
+   ```powershell
+   New-NetFirewallRule -DisplayName "Arma Reforger" -Direction Inbound -Protocol UDP -LocalPort 2001,17777 -Action Allow
+   New-NetFirewallRule -DisplayName "Arma Panel" -Direction Inbound -Protocol TCP -LocalPort 8888 -Action Allow
+   ```
+5. Start the panel with `python app.py` and open `http://YOUR_SERVER_IP:8888`.
+
+To start the panel at boot, put a shortcut to `python app.py` in the Startup folder of the user that runs the server, or run it as a service with [NSSM](https://nssm.cc/). With NSSM, run `nssm set <service> AppKillProcessTree 0` so that restarting the panel doesn't also kill the game server.
+
+**How stop and restart work on Windows.** The panel starts the server in its own console window, just like running it by hand. **Stop** and **Soft restart** send that console Ctrl+C, so the server saves the game state and exits cleanly. **Restart** is a hard restart: it kills the server immediately without saving, then starts it again. Start the server from the panel. If you start it by hand from a `.bat` file, the panel can still stop it, but the batch window will be left asking `Terminate batch job (Y/N)?`.
+
+---
+
+### Option D — Update panel files only
 
 After pulling a new version from GitHub:
 
@@ -106,6 +144,9 @@ LOG_DIR=/home/arma/.config/ArmaReforger/logs
 
 # Server FPS cap (passed as -maxFPS on startup)
 MAX_FPS=60
+
+# Seconds to wait for the server to save and exit on Stop / Soft restart
+SHUTDOWN_TIMEOUT=180
 ```
 
 After editing, restart the panel:
@@ -161,6 +202,8 @@ If you use **HestiaCP**, add a subdomain through its web interface — it handle
 ```
 arma-reforger-panel/
 ├── app.py               # Flask backend — API, server control, metrics
+├── win_ctrl_c.py        # Windows helper: sends Ctrl+C to the server console
+├── requirements.txt     # Python dependencies (for pip / Windows)
 ├── index.html           # Main panel UI (English)
 ├── login.html           # Login screen
 ├── config.env           # Your local config (excluded from git)

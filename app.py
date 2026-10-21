@@ -12,15 +12,19 @@ Local fork — modifications:
 
 from flask import Flask, request, jsonify, session, redirect, Response, send_from_directory
 import bcrypt
+import psutil
 import hmac
 import re
 import secrets
 import subprocess
+import sys
 import os
 import json
 import threading
 import time
 import glob
+
+IS_WINDOWS = os.name == "nt"
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
@@ -28,7 +32,7 @@ def load_env(path="config.env"):
     env = {}
     if not os.path.exists(path):
         return env
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
@@ -53,21 +57,35 @@ if not PANEL_PASSWORD_HASH:
     PANEL_PASSWORD_HASH = bcrypt.hashpw(b"changeme", bcrypt.gensalt()).decode()
     print("[panel] WARNING: no panel password set. Defaulting to 'changeme'.", flush=True)
 
+# On Windows the server keeps logs, addons and profile under
+# Documents\My Games\ArmaReforger of the user it runs as.
+_WIN_GAME_HOME = os.path.join(os.path.expanduser("~"), "Documents", "My Games", "ArmaReforger")
+
 PANEL_PORT     = int(_cfg.get("PANEL_PORT", 8888))
-SERVER_DIR     = _cfg.get("SERVER_DIR",    "/home/arma/server")
-SERVER_CONFIG  = _cfg.get("SERVER_CONFIG", "/home/arma/server/config.json")
-LOG_DIR        = _cfg.get("LOG_DIR",       "/home/arma/.config/ArmaReforger/logs")
-WORKSHOP_DIR   = _cfg.get("WORKSHOP_DIR",  os.path.expanduser("~/.local/share/Arma Reforger/addons"))
+if IS_WINDOWS:
+    SERVER_DIR    = _cfg.get("SERVER_DIR",    r"C:\arma\server")
+    SERVER_CONFIG = _cfg.get("SERVER_CONFIG", os.path.join(SERVER_DIR, "config.json"))
+    LOG_DIR       = _cfg.get("LOG_DIR",       os.path.join(_WIN_GAME_HOME, "logs"))
+    WORKSHOP_DIR  = _cfg.get("WORKSHOP_DIR",  os.path.join(_WIN_GAME_HOME, "addons"))
+else:
+    SERVER_DIR    = _cfg.get("SERVER_DIR",    "/home/arma/server")
+    SERVER_CONFIG = _cfg.get("SERVER_CONFIG", "/home/arma/server/config.json")
+    LOG_DIR       = _cfg.get("LOG_DIR",       "/home/arma/.config/ArmaReforger/logs")
+    WORKSHOP_DIR  = _cfg.get("WORKSHOP_DIR",  os.path.expanduser("~/.local/share/Arma Reforger/addons"))
 # Where Reforger writes session saves. The real layout produced by the server
 # under install.sh defaults is `{LOG_DIR_parent}/profile/.save/`, e.g.
 # `/home/arma/.config/ArmaReforger/profile/.save/{game,playersave,settings}/`.
 # Override with PROFILE_DIR in config.env if your install differs.
 PROFILE_DIR    = _cfg.get(
     "PROFILE_DIR",
-    os.path.join(os.path.dirname(LOG_DIR.rstrip("/")) or "/home/arma/.config/ArmaReforger", "profile"),
+    os.path.join(os.path.dirname(LOG_DIR.rstrip("/\\")) or "/home/arma/.config/ArmaReforger", "profile"),
 )
-SERVER_BINARY  = "./ArmaReforgerServer"
+SERVER_BINARY  = os.path.join(SERVER_DIR, "ArmaReforgerServer.exe" if IS_WINDOWS else "ArmaReforgerServer")
 MAX_FPS        = _cfg.get("MAX_FPS", "").strip()
+# Seconds to wait for the server to save and exit on stop / soft restart.
+SHUTDOWN_TIMEOUT = int(_cfg.get("SHUTDOWN_TIMEOUT", 180))
+# Small helper that delivers Ctrl+C to the server's console on Windows.
+_CTRL_C_HELPER = os.path.join(_BASE_DIR, "win_ctrl_c.py")
 
 def build_server_args():
     """Build the launch arguments. `-loadSessionSave` is always passed: with no
@@ -257,7 +275,7 @@ _SCAN_CACHE_FILE = os.path.join(_BASE_DIR, ".scenario-cache.json")
 
 def _scan_cache_load():
     try:
-        with open(_SCAN_CACHE_FILE) as f:
+        with open(_SCAN_CACHE_FILE, encoding="utf-8") as f:
             data = json.load(f)
         return data.get("mods", {}), data.get("mtimes", {})
     except (OSError, json.JSONDecodeError):
@@ -266,7 +284,7 @@ def _scan_cache_load():
 
 def _scan_cache_save(mods, mtimes):
     try:
-        with open(_SCAN_CACHE_FILE, "w") as f:
+        with open(_SCAN_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump({"mods": mods, "mtimes": mtimes, "saved_at": time.time()}, f)
     except OSError as e:
         print(f"[panel] WARNING: could not write scenario cache: {e}", flush=True)
@@ -288,6 +306,8 @@ def _candidate_addon_roots():
     # Workshop mod dirs (downloaded via SteamCMD / the game)
     if WORKSHOP_DIR:
         roots.append((WORKSHOP_DIR, False))
+    if IS_WINDOWS:
+        roots.append((os.path.join(_WIN_GAME_HOME, "addons"), False))
     roots.extend([
         (os.path.join(home, ".local/share/Arma Reforger/profile/addons"), False),
         (os.path.join(home, ".local/share/Arma Reforger/addons"),         False),
@@ -606,19 +626,44 @@ def all_scenarios_cached():
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-def get_server_pid():
-    try:
-        r = subprocess.run(["pgrep", "-f", "ArmaReforgerServer"], capture_output=True, text=True)
-        pids = r.stdout.strip().splitlines()
-        return int(pids[0]) if pids else None
-    except Exception:
-        return None
+# The server's psutil.Process is kept between calls: cpu_percent() measures
+# usage since the previous call on the same object.
+_server_proc = None
 
-def get_process_uptime(pid):
+def _is_server_process(p):
+    # Linux truncates process names to 15 chars, so also look at argv[0].
+    if (p.info.get("name") or "").startswith("ArmaReforgerSer"):
+        return True
+    cmd = p.info.get("cmdline") or []
+    return bool(cmd) and os.path.basename(cmd[0]).startswith("ArmaReforgerServer")
+
+def get_server_process():
+    global _server_proc
+    p = _server_proc
+    if p is not None:
+        try:
+            if p.is_running() and p.status() != psutil.STATUS_ZOMBIE:
+                return p
+        except psutil.Error:
+            pass
+        _server_proc = None
+    for p in psutil.process_iter(["name", "cmdline"]):
+        try:
+            if _is_server_process(p) and p.status() != psutil.STATUS_ZOMBIE:
+                _server_proc = p
+                return p
+        except psutil.Error:
+            continue
+    return None
+
+def get_server_pid():
+    p = get_server_process()
+    return p.pid if p else None
+
+def get_process_uptime(proc):
     try:
-        r = subprocess.run(["ps", "-o", "etimes=", "-p", str(pid)], capture_output=True, text=True)
-        return int(r.stdout.strip())
-    except Exception:
+        return max(0, int(time.time() - proc.create_time()))
+    except psutil.Error:
         return 0
 
 def format_uptime(seconds):
@@ -626,33 +671,60 @@ def format_uptime(seconds):
     if seconds < 3600:  return f"{seconds // 60}m {seconds % 60}s"
     return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
 
-def get_cpu_count():
+def get_cpu_ram(proc):
     try:
-        r = subprocess.run(["nproc"], capture_output=True, text=True)
-        return max(1, int(r.stdout.strip()))
-    except Exception:
-        return 1
-
-def get_cpu_ram(pid):
-    try:
-        r = subprocess.run(["ps", "-p", str(pid), "-o", "pcpu=,rss="], capture_output=True, text=True)
-        parts = r.stdout.strip().split()
-        cpu = round(float(parts[0]) / get_cpu_count(), 1)
-        ram = round(int(parts[1]) / 1024, 1)
+        cpu = round(proc.cpu_percent(None) / (psutil.cpu_count() or 1), 1)
+        ram = round(proc.memory_info().rss / 1024 / 1024, 1)
         return cpu, ram
-    except Exception:
+    except psutil.Error:
         return 0.0, 0.0
 
 def get_system_ram():
     try:
-        with open("/proc/meminfo") as f:
-            lines = f.readlines()
-        mem = {l.split()[0].rstrip(":"): int(l.split()[1]) for l in lines if len(l.split()) >= 2}
-        total = round(mem["MemTotal"] / 1024, 1)
-        used  = round((mem["MemTotal"] - mem["MemAvailable"]) / 1024, 1)
+        mem = psutil.virtual_memory()
+        total = round(mem.total / 1024 / 1024, 1)
+        used  = round((mem.total - mem.available) / 1024 / 1024, 1)
         return used, total
     except Exception:
         return 0, 0
+
+def tail_lines(path, n):
+    """Last `n` lines of a file, read backwards in blocks so big logs stay cheap."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        pos = f.tell()
+        data = b""
+        while pos > 0 and data.count(b"\n") <= n:
+            step = min(8192, pos)
+            pos -= step
+            f.seek(pos)
+            data = f.read(step) + data
+    return data.decode("utf-8", errors="replace").splitlines()[-n:]
+
+def launch_server():
+    if IS_WINDOWS:
+        # Give the server its own console, as if started by hand, so the panel
+        # can later send it Ctrl+C for a clean save-and-exit.
+        subprocess.Popen([SERVER_BINARY] + build_server_args(), cwd=SERVER_DIR,
+                         creationflags=subprocess.CREATE_NEW_CONSOLE)
+    else:
+        subprocess.Popen([SERVER_BINARY] + build_server_args(), cwd=SERVER_DIR,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+
+def request_shutdown(proc):
+    """Ask the server to save the game state and exit. On Windows this is the
+    same as pressing Ctrl+C in its console; on Linux it sends SIGTERM."""
+    if not IS_WINDOWS:
+        proc.terminate()
+        return
+    # Attaching to another process's console means leaving our own first, so
+    # it's done in a short-lived helper rather than in the panel itself.
+    r = subprocess.run([sys.executable, _CTRL_C_HELPER, str(proc.pid)],
+                       capture_output=True, text=True, timeout=15,
+                       creationflags=subprocess.DETACHED_PROCESS)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"Ctrl+C helper exited with code {r.returncode}")
 
 def get_latest_log():
     try:
@@ -666,13 +738,13 @@ def get_latest_log():
 
 def read_config():
     try:
-        with open(SERVER_CONFIG) as f:
+        with open(SERVER_CONFIG, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
 def write_config(cfg):
-    with open(SERVER_CONFIG, "w") as f:
+    with open(SERVER_CONFIG, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent="\t")
 
 # ─── PERSISTENCE ─────────────────────────────────────────────────────────────
@@ -817,7 +889,8 @@ def index():
     if not session.get("logged_in"):
         return redirect("/login")
     _ensure_csrf()
-    return open(os.path.join(os.path.dirname(__file__), "index.html")).read()
+    with open(os.path.join(_BASE_DIR, "index.html"), encoding="utf-8") as f:
+        return f.read()
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -836,7 +909,8 @@ def login():
             _ensure_csrf()
             return jsonify({"ok": True, "csrf": session["csrf"]})
         return jsonify({"ok": False, "error": "Invalid password"}), 401
-    return open(os.path.join(os.path.dirname(__file__), "login.html")).read()
+    with open(os.path.join(_BASE_DIR, "login.html"), encoding="utf-8") as f:
+        return f.read()
 
 @app.route("/logout", methods=["POST"])
 def logout():
@@ -854,18 +928,21 @@ def api_csrf():
 def api_status():
     if not session.get("logged_in"):
         return jsonify({"error": "unauthorized"}), 401
-    pid = get_server_pid()
+    proc = get_server_process()
+    pid = proc.pid if proc else None
     cfg = read_config()
-    cpu, ram = get_cpu_ram(pid) if pid else (0.0, 0.0)
+    cpu, ram = get_cpu_ram(proc) if proc else (0.0, 0.0)
+    uptime = get_process_uptime(proc) if proc else 0
     ram_used, ram_total = get_system_ram()
     missions = all_scenarios_cached()
     return jsonify({
         "running":        pid is not None,
         "pid":            pid,
+        "lifecycle":      dict(_LIFECYCLE),
         "map":            get_map_name(cfg),
         "players":        0,
-        "uptime":         format_uptime(get_process_uptime(pid)) if pid else "—",
-        "uptime_sec":     get_process_uptime(pid) if pid else 0,
+        "uptime":         format_uptime(uptime) if proc else "—",
+        "uptime_sec":     uptime,
         "server_name":    cfg.get("game", {}).get("name", "—"),
         "ip":             cfg.get("publicAddress", "—"),
         "port":           cfg.get("publicPort", "—"),
@@ -902,26 +979,25 @@ def api_scenarios_rescan():
 def api_metrics():
     if not session.get("logged_in"):
         return jsonify({"error": "unauthorized"}), 401
-    pid = get_server_pid()
-    cpu, ram = get_cpu_ram(pid) if pid else (0.0, 0.0)
+    proc = get_server_process()
+    cpu, ram = get_cpu_ram(proc) if proc else (0.0, 0.0)
     ram_used, ram_total = get_system_ram()
     return jsonify({
         "cpu": cpu, "ram_process": ram,
         "ram_used": ram_used, "ram_total": ram_total,
-        "running": pid is not None, "ts": int(time.time()),
+        "running": proc is not None, "ts": int(time.time()),
     })
 
 @app.route("/api/logs")
 def api_logs():
     if not session.get("logged_in"):
         return jsonify({"error": "unauthorized"}), 401
-    n = int(request.args.get("lines", 100))
+    n = max(1, min(int(request.args.get("lines", 100)), 5000))
     path = get_latest_log()
     if not path:
         return jsonify({"lines": [], "path": None})
     try:
-        r = subprocess.run(["tail", "-n", str(n), path], capture_output=True, text=True)
-        return jsonify({"lines": r.stdout.splitlines(), "path": path})
+        return jsonify({"lines": tail_lines(path, n), "path": path})
     except Exception as e:
         return jsonify({"lines": [], "error": str(e)})
 
@@ -1192,53 +1268,90 @@ def api_start():
         return jsonify({"error": "unauthorized"}), 401
     err = _csrf_required()
     if err: return err
+    if _LIFECYCLE["action"]:
+        return jsonify({"ok": False, "error": f"A {_LIFECYCLE['action']} is already in progress"})
     if get_server_pid():
         return jsonify({"ok": False, "error": "Server is already running"})
     try:
-        subprocess.Popen([SERVER_BINARY] + build_server_args(), cwd=SERVER_DIR,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+        launch_server()
         time.sleep(1)
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
+
+# ─── STOP / RESTART ──────────────────────────────────────────────────────────
+#
+# These can take minutes (the server writes its save before exiting), so they
+# run in a background thread; /api/status reports progress under "lifecycle".
+#   stop          ask the server to save and exit
+#   restart       hard: kill the server and start it again (no save first)
+#   soft-restart  ask the server to save and exit, then start it again; the
+#                 launch always passes -loadSessionSave, so it resumes from
+#                 that save
+
+_LIFECYCLE_LOCK = threading.Lock()
+_LIFECYCLE = {"action": None, "phase": None, "last": None}
+
+def _wait_for_exit(proc, what):
+    try:
+        proc.wait(SHUTDOWN_TIMEOUT)
+    except psutil.TimeoutExpired:
+        raise RuntimeError(f"Server did not {what} within {SHUTDOWN_TIMEOUT}s and was left running")
+
+def _run_lifecycle(action, proc):
+    error = None
+    try:
+        try:
+            if proc is not None and action == "restart":
+                _LIFECYCLE["phase"] = "stopping"
+                proc.terminate()  # SIGTERM on Linux, an immediate kill on Windows
+                try:
+                    proc.wait(SHUTDOWN_TIMEOUT)
+                except psutil.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(10)
+            elif proc is not None:
+                _LIFECYCLE["phase"] = "saving"
+                request_shutdown(proc)
+                _wait_for_exit(proc, "save and exit")
+        except psutil.NoSuchProcess:
+            pass  # it exited on its own in the meantime
+        if action != "stop":
+            _LIFECYCLE["phase"] = "starting"
+            launch_server()
+    except Exception as e:
+        error = str(e)
+    _LIFECYCLE["last"] = {"action": action, "ok": error is None, "error": error, "ts": int(time.time())}
+    _LIFECYCLE["phase"] = None
+    _LIFECYCLE["action"] = None
+
+def _begin_lifecycle(action, require_running):
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    err = _csrf_required()
+    if err: return err
+    proc = get_server_process()
+    if require_running and proc is None:
+        return jsonify({"ok": False, "error": "Server is not running"})
+    with _LIFECYCLE_LOCK:
+        if _LIFECYCLE["action"]:
+            return jsonify({"ok": False, "error": f"A {_LIFECYCLE['action']} is already in progress"})
+        _LIFECYCLE["action"] = action
+        _LIFECYCLE["phase"] = None
+    threading.Thread(target=_run_lifecycle, args=(action, proc), daemon=True).start()
+    return jsonify({"ok": True, "pending": True, "persistence": _persistence_enabled()})
 
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
-    if not session.get("logged_in"):
-        return jsonify({"error": "unauthorized"}), 401
-    err = _csrf_required()
-    if err: return err
-    pid = get_server_pid()
-    if not pid:
-        return jsonify({"ok": False, "error": "Server is not running"})
-    try:
-        subprocess.run(["kill", str(pid)], check=True)
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
+    return _begin_lifecycle("stop", require_running=True)
 
 @app.route("/api/restart", methods=["POST"])
 def api_restart():
-    if not session.get("logged_in"):
-        return jsonify({"error": "unauthorized"}), 401
-    err = _csrf_required()
-    if err: return err
-    pid = get_server_pid()
-    if pid:
-        try:
-            subprocess.run(["kill", str(pid)], check=True)
-            time.sleep(3)
-        except Exception as e:
-            return jsonify({"ok": False, "error": f"Stop failed: {e}"})
-    try:
-        subprocess.Popen([SERVER_BINARY] + build_server_args(), cwd=SERVER_DIR,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
-        time.sleep(1)
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
+    return _begin_lifecycle("restart", require_running=False)
+
+@app.route("/api/soft-restart", methods=["POST"])
+def api_soft_restart():
+    return _begin_lifecycle("soft-restart", require_running=True)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PANEL_PORT, threaded=True)

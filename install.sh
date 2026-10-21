@@ -81,6 +81,8 @@ if [[ "$MODE" == "update" ]]; then
     # Read existing user from panel service
     EXISTING_USER=$(grep "^User=" /etc/systemd/system/arma-panel.service 2>/dev/null | cut -d= -f2 || echo "arma")
     PANEL_DIR_EXISTING=$(grep "^WorkingDirectory=" /etc/systemd/system/arma-panel.service 2>/dev/null | cut -d= -f2 || echo "$PANEL_DIR")
+    # psutil became a dependency after the first release; make sure it's there.
+    apt-get install -y -qq python3-psutil
     cp "$SCRIPT_DIR/app.py"     "$PANEL_DIR_EXISTING/"
     cp "$SCRIPT_DIR/index.html" "$PANEL_DIR_EXISTING/"
     cp "$SCRIPT_DIR/login.html" "$PANEL_DIR_EXISTING/"
@@ -187,7 +189,7 @@ if [[ "$MODE" == "full" ]]; then
     # Install Flask and bcrypt via apt rather than pip — avoids the "Cannot
     # uninstall blinker, RECORD file not found" error caused by pip trying
     # to replace apt-managed dependencies on Ubuntu 24.04.
-    apt-get install -y -qq python3 curl lib32gcc-s1 binutils python3-flask python3-bcrypt
+    apt-get install -y -qq python3 curl lib32gcc-s1 binutils python3-flask python3-bcrypt python3-psutil
     echo -e "      ${GREEN}✓ Done.${NC}"
 
     # Step 3: SteamCMD
@@ -288,7 +290,7 @@ echo -e "${YELLOW}[${PANEL_STEP}/${TOTAL_STEPS}] Installing management panel...$
 # Dependencies (panel-only mode)
 if [[ "$MODE" == "panel" ]]; then
     apt-get update -qq
-    apt-get install -y -qq python3 binutils python3-flask python3-bcrypt
+    apt-get install -y -qq python3 binutils python3-flask python3-bcrypt python3-psutil
 fi
 
 mkdir -p "$PANEL_DIR/static"
