@@ -14,8 +14,8 @@ A lightweight, self-hosted web panel for managing your **Arma Reforger dedicated
 - **Linux and Windows** — Runs on Ubuntu (with the installer) or on Windows Server (manual setup)
 - **Real-time monitoring** — Live CPU and RAM charts updated every 3 seconds
 - **Live log streaming** — Server console logs with colour-coded output (errors, warnings, network events)
-- **Mission selector** — 41 built-in missions including all vanilla and RHS — Status Quo scenarios
-- **Mod management** — Add and remove Workshop mods directly from the panel
+- **Mission selector** — Pick the scenario by its resource name (e.g. `{0648CDB32D6B02B3}Missions/SP02_AirSupport.conf`); vanilla scenarios plus any found in installed mods
+- **Mod lists** — Keep several named mod lists, edit each as JSON, and pick one from a dropdown; the selected list is written into `config.json` every time the server starts
 - **Config editor** — Edit server name, scenario, passwords without touching the filesystem
 - **PWA support** — Installable as a native app on Android and iOS
 - **Single config file** — All settings in one `config.env`, no code editing required
@@ -247,6 +247,7 @@ arma-reforger-panel/
 ├── app.py               # Flask backend — API, server control, metrics
 ├── win_ctrl_c.py        # Windows helper: sends Ctrl+C to the server console
 ├── requirements.txt     # Python dependencies (for pip / Windows)
+├── modlists/            # Saved mod lists, one JSON file each (created at runtime)
 ├── index.html           # Main panel UI (English)
 ├── login.html           # Login screen
 ├── config.env           # Your local config (excluded from git)

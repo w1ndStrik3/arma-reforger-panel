@@ -6,7 +6,7 @@ Local fork — modifications:
   - Bcrypt-hashed admin password + constant-time verification + rate limiting
   - CSRF protection on state-changing routes
   - Persistent SECRET_KEY (sessions survive panel restart)
-  - Bulk mod import via pasted JSON array or uploaded JSON file
+  - Named mod lists (one selected list is written into config.json at every launch)
   - Auto-discovery of scenarios from installed mods (`.pak` strings scan, mtime-cached)
 """
 
@@ -715,6 +715,7 @@ def tail_lines(path, n):
     return data.decode("utf-8", errors="replace").splitlines()[-n:]
 
 def launch_server():
+    apply_selected_modlist()
     if IS_WINDOWS:
         # Give the server its own console, as if started by hand, so the panel
         # can later send it Ctrl+C for a clean save-and-exit.
@@ -872,20 +873,10 @@ def _flush_saves():
 
 
 def get_map_name(cfg=None):
-    try:
-        if cfg is None:
-            cfg = read_config()
-        sid = cfg.get("game", {}).get("scenarioId", "")
-        if not sid:
-            return "Unknown"
-        # Consult the full merged list (vanilla + discovered, with overrides
-        # already applied) so the dashboard tile matches the dropdown.
-        for m in all_scenarios_cached():
-            if m["id"] == sid:
-                return m["name"]
-        return sid.split("/")[-1].replace(".conf", "")
-    except Exception:
-        return "Unknown"
+    """The scenario's resource name, e.g. {0648CDB32D6B02B3}Missions/SP02_AirSupport.conf."""
+    if cfg is None:
+        cfg = read_config()
+    return cfg.get("game", {}).get("scenarioId", "") or "Unknown"
 
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
 
@@ -969,7 +960,6 @@ def api_status():
         "ram_process":    ram,
         "ram_used":       ram_used,
         "ram_total":      ram_total,
-        "mods":           cfg.get("game", {}).get("mods", []),
         "csrf":           _ensure_csrf(),
     })
 
@@ -1013,29 +1003,6 @@ def api_logs():
         return jsonify({"lines": tail_lines(path, n), "path": path})
     except Exception as e:
         return jsonify({"lines": [], "error": str(e)})
-
-def _normalize_mod_entry(entry):
-    """Validate one mod row. Returns canonical dict or None."""
-    if not isinstance(entry, dict):
-        return None
-    mod_id = str(entry.get("modId", "")).strip()
-    if not mod_id or len(mod_id) > 32:
-        return None
-    if not all(c in "0123456789ABCDEFabcdef" for c in mod_id):
-        return None
-    out = {"modId": mod_id.upper()}
-    name = str(entry.get("name", "")).strip()
-    if name:
-        if len(name) > 200 or any(c in name for c in "\n\r"):
-            return None
-        out["name"] = name
-    version = str(entry.get("version", "")).strip()
-    if version:
-        if len(version) > 32 or any(c in version for c in '\n\r"\\'):
-            return None
-        out["version"] = version
-    return out
-
 
 @app.route("/api/config", methods=["POST"])
 def api_config():
@@ -1141,139 +1108,202 @@ def api_persistence_flush():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
-@app.route("/api/mods/add", methods=["POST"])
-def api_mods_add():
+# ─── MOD LISTS ───────────────────────────────────────────────────────────────
+#
+# Each mod list is a JSON array saved as modlists/<name>.json. One list is
+# selected (stored in .panel-state.json); right before every server launch its
+# contents replace game.mods in config.json. On first run the mods currently in
+# config.json become a list named "default".
+
+MODLISTS_DIR = os.path.join(_BASE_DIR, "modlists")
+_STATE_FILE  = os.path.join(_BASE_DIR, ".panel-state.json")
+_MODLIST_LOCK = threading.Lock()
+
+_MODLIST_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.()-]{0,63}")
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"{p}{i}" for p in ("COM", "LPT") for i in range(1, 10)}
+
+def _valid_modlist_name(name):
+    # Names become file names, so keep them safe on both Linux and Windows.
+    return (isinstance(name, str) and _MODLIST_NAME_RE.fullmatch(name) is not None
+            and not name.endswith((".", " "))
+            and name.split(".")[0].strip().upper() not in _WIN_RESERVED)
+
+def _modlist_path(name):
+    return os.path.join(MODLISTS_DIR, name + ".json")
+
+def list_modlists():
+    if not os.path.isdir(MODLISTS_DIR):
+        return []
+    names = [fn[:-5] for fn in os.listdir(MODLISTS_DIR) if fn.endswith(".json")]
+    return sorted((n for n in names if _valid_modlist_name(n)), key=str.casefold)
+
+def _find_modlist(name):
+    """The stored list matching `name` ignoring case (Windows file names are
+    case-insensitive), or None."""
+    for n in list_modlists():
+        if n.casefold() == name.casefold():
+            return n
+    return None
+
+def parse_modlist(text):
+    """Validate a mod list's JSON text. Returns (mods, error). Entries are kept
+    exactly as written apart from the checks below."""
+    try:
+        mods = json.loads(text)
+    except json.JSONDecodeError as e:
+        return None, f"Invalid JSON: {e.msg} at line {e.lineno} col {e.colno}"
+    if not isinstance(mods, list):
+        return None, "A mod list must be a JSON array: [ ... ]"
+    seen = set()
+    for i, m in enumerate(mods, 1):
+        if not isinstance(m, dict):
+            return None, f"Entry #{i} is not an object"
+        mod_id = m.get("modId")
+        if not isinstance(mod_id, str) or not re.fullmatch(r"[0-9A-Fa-f]{1,32}", mod_id):
+            return None, f"Entry #{i}: modId must be 1-32 hex characters"
+        if mod_id.upper() in seen:
+            return None, f"Entry #{i}: duplicate modId {mod_id}"
+        seen.add(mod_id.upper())
+    return mods, None
+
+def load_modlist(name):
+    with open(_modlist_path(name), encoding="utf-8") as f:
+        mods, error = parse_modlist(f.read())
+    if error:
+        raise ValueError(f"Mod list '{name}': {error}")
+    return mods
+
+def save_modlist(name, mods):
+    os.makedirs(MODLISTS_DIR, exist_ok=True)
+    tmp = _modlist_path(name) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(mods, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, _modlist_path(name))
+
+def get_selected_modlist():
+    try:
+        with open(_STATE_FILE, encoding="utf-8") as f:
+            name = json.load(f).get("selected_modlist")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return name if isinstance(name, str) and _find_modlist(name) == name else None
+
+def set_selected_modlist(name):
+    with open(_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"selected_modlist": name}, f)
+
+def ensure_modlists():
+    """First run: turn the mods currently in config.json into a "default" list."""
+    with _MODLIST_LOCK:
+        if os.path.isdir(MODLISTS_DIR):
+            return
+        save_modlist("default", read_config().get("game", {}).get("mods", []))
+        set_selected_modlist("default")
+
+def apply_selected_modlist():
+    """Write the selected mod list into config.json's game.mods. Called right
+    before every launch; with no list selected config.json is left alone."""
+    name = get_selected_modlist()
+    if not name:
+        return
+    mods = load_modlist(name)
+    # Not read_config(): it returns {} on a read error, and writing that back
+    # would wipe the rest of the server config.
+    with open(SERVER_CONFIG, encoding="utf-8") as f:
+        cfg = json.load(f)
+    cfg.setdefault("game", {})["mods"] = mods
+    write_config(cfg)
+
+def _modlists_response(**extra):
+    return jsonify({"ok": True, "lists": list_modlists(), "selected": get_selected_modlist(), **extra})
+
+@app.route("/api/modlists")
+def api_modlists():
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    ensure_modlists()
+    return _modlists_response()
+
+@app.route("/api/modlists/get")
+def api_modlists_get():
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    name = _find_modlist(request.args.get("name", ""))
+    if not name:
+        return jsonify({"ok": False, "error": "Mod list not found"})
+    try:
+        with open(_modlist_path(name), encoding="utf-8") as f:
+            return jsonify({"ok": True, "name": name, "text": f.read()})
+    except OSError as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+@app.route("/api/modlists/save", methods=["POST"])
+def api_modlists_save():
+    """Body: {name, text, create}. create=true makes a new list (and selects
+    it); otherwise an existing list is overwritten."""
     if not session.get("logged_in"):
         return jsonify({"error": "unauthorized"}), 401
     err = _csrf_required()
     if err: return err
     data = request.get_json(silent=True) or {}
-    norm = _normalize_mod_entry({"modId": data.get("modId",""), "name": data.get("name",""), "version": data.get("version","")})
-    if not norm:
-        return jsonify({"ok": False, "error": "Invalid mod entry (modId must be 1-32 hex chars)"})
-    if "name" not in norm:
-        return jsonify({"ok": False, "error": "name is required for manual entry"})
-    cfg  = read_config()
-    mods = cfg.setdefault("game", {}).setdefault("mods", [])
-    if any(m.get("modId", "").upper() == norm["modId"] for m in mods):
-        return jsonify({"ok": False, "error": "Mod with this ID already exists"})
-    mods.append(norm)
-    try:
-        write_config(cfg)
-        return jsonify({"ok": True, "restart_required": get_server_pid() is not None, "mods": mods})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
-
-@app.route("/api/mods/import", methods=["POST"])
-def api_mods_import():
-    """Bulk-import mods. Accepts either:
-       - multipart/form-data with a 'file' part containing a JSON array, plus
-         form fields 'mode' (replace|merge) and '_csrf'.
-       - application/json with {payload: <text or array>, mode, _csrf}.
-    """
-    if not session.get("logged_in"):
-        return jsonify({"error": "unauthorized"}), 401
-    err = _csrf_required()
-    if err: return err
-
-    raw = None
-    mode = "replace"
-
-    if request.files and "file" in request.files:
-        f = request.files["file"]
+    name = str(data.get("name", "")).strip()
+    create = bool(data.get("create"))
+    if not _valid_modlist_name(name):
+        return jsonify({"ok": False, "error": "Name must be 1-64 characters: letters, numbers, spaces and _ . ( ) -"})
+    mods, error = parse_modlist(str(data.get("text", "")))
+    if error:
+        return jsonify({"ok": False, "error": error})
+    with _MODLIST_LOCK:
+        existing = _find_modlist(name)
+        if create and existing:
+            return jsonify({"ok": False, "error": f"A mod list named '{existing}' already exists"})
+        if not create and not existing:
+            return jsonify({"ok": False, "error": "Mod list not found"})
+        name = existing or name
         try:
-            raw = f.read().decode("utf-8")
-        except UnicodeDecodeError:
-            return jsonify({"ok": False, "error": "File must be UTF-8 encoded JSON"}), 400
-        mode = (request.form.get("mode") or "replace").strip().lower()
-    else:
-        body = request.get_json(silent=True) or {}
-        payload = body.get("payload")
-        if isinstance(payload, list):
-            raw = json.dumps(payload)
-        elif isinstance(payload, str):
-            raw = payload
-        mode = (body.get("mode") or "replace").strip().lower()
+            save_modlist(name, mods)
+            if create:
+                set_selected_modlist(name)
+        except OSError as e:
+            return jsonify({"ok": False, "error": str(e)})
+    affects_server = get_selected_modlist() == name and get_server_pid() is not None
+    return _modlists_response(name=name, count=len(mods), restart_required=affects_server)
 
-    if mode not in ("replace", "merge"):
-        return jsonify({"ok": False, "error": "mode must be 'replace' or 'merge'"}), 400
-    if not raw or not raw.strip():
-        return jsonify({"ok": False, "error": "Empty payload"}), 400
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        return jsonify({"ok": False, "error": f"Invalid JSON: {e.msg} at line {e.lineno} col {e.colno}"}), 400
-    if not isinstance(data, list):
-        return jsonify({"ok": False, "error": "Top-level value must be a JSON array"}), 400
-
-    valid = []
-    skipped = []
-    seen = set()
-    for i, entry in enumerate(data):
-        norm = _normalize_mod_entry(entry)
-        if not norm:
-            skipped.append(f"#{i + 1}: invalid")
-            continue
-        if norm["modId"] in seen:
-            skipped.append(f"#{i + 1}: duplicate modId {norm['modId']}")
-            continue
-        seen.add(norm["modId"])
-        valid.append(norm)
-
-    cfg = read_config()
-    g   = cfg.setdefault("game", {})
-
-    if mode == "merge":
-        existing = list(g.get("mods", []))
-        existing_ids = {str(m.get("modId", "")).upper() for m in existing}
-        added = 0
-        for m in valid:
-            if m["modId"] not in existing_ids:
-                existing.append(m)
-                existing_ids.add(m["modId"])
-                added += 1
-        g["mods"] = existing
-        msg = f"Merged: {added} added, {len(valid) - added} already present"
-    else:
-        g["mods"] = valid
-        msg = f"Replaced full mod list with {len(valid)} entries"
-
-    try:
-        write_config(cfg)
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-    return jsonify({
-        "ok": True,
-        "message": msg,
-        "imported": len(valid),
-        "skipped": skipped,
-        "mods": g["mods"],
-        "restart_required": get_server_pid() is not None,
-    })
-
-@app.route("/api/mods/remove", methods=["POST"])
-def api_mods_remove():
+@app.route("/api/modlists/select", methods=["POST"])
+def api_modlists_select():
     if not session.get("logged_in"):
         return jsonify({"error": "unauthorized"}), 401
     err = _csrf_required()
     if err: return err
-    data   = request.get_json(silent=True) or {}
-    mod_id = data.get("modId", "").strip().upper()
-    if not mod_id:
-        return jsonify({"ok": False, "error": "Missing modId"})
-    cfg  = read_config()
-    mods = cfg.get("game", {}).get("mods", [])
-    new  = [m for m in mods if str(m.get("modId", "")).upper() != mod_id]
-    if len(new) == len(mods):
-        return jsonify({"ok": False, "error": "Mod not found"})
-    cfg.setdefault("game", {})["mods"] = new
+    name = _find_modlist(str((request.get_json(silent=True) or {}).get("name", "")))
+    if not name:
+        return jsonify({"ok": False, "error": "Mod list not found"})
     try:
-        write_config(cfg)
-        return jsonify({"ok": True, "restart_required": get_server_pid() is not None, "mods": new})
-    except Exception as e:
+        set_selected_modlist(name)
+    except OSError as e:
         return jsonify({"ok": False, "error": str(e)})
+    return _modlists_response(restart_required=get_server_pid() is not None)
+
+@app.route("/api/modlists/delete", methods=["POST"])
+def api_modlists_delete():
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    err = _csrf_required()
+    if err: return err
+    with _MODLIST_LOCK:
+        name = _find_modlist(str((request.get_json(silent=True) or {}).get("name", "")))
+        if not name:
+            return jsonify({"ok": False, "error": "Mod list not found"})
+        was_selected = get_selected_modlist() == name
+        try:
+            os.remove(_modlist_path(name))
+            remaining = list_modlists()
+            if was_selected:
+                set_selected_modlist(remaining[0] if remaining else None)
+        except OSError as e:
+            return jsonify({"ok": False, "error": str(e)})
+    return _modlists_response(restart_required=was_selected and get_server_pid() is not None)
 
 @app.route("/api/start", methods=["POST"])
 def api_start():

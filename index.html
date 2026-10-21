@@ -181,6 +181,7 @@
   .status-text.loading { color: var(--warn); }
 
   .divider-v { width: 1px; height: 32px; background: var(--border); flex-shrink: 0; }
+  #map-name { font-family: 'Roboto Mono', monospace; font-weight: 500; font-size: 13px; letter-spacing: 0; overflow-wrap: anywhere; }
 
   .stat-item { display: flex; flex-direction: column; gap: 3px; }
   .stat-item .label {
@@ -342,6 +343,21 @@
   }
   .btn-save:hover { background: var(--accent2); }
   .btn-save:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-save.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  .btn-save.ghost:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-save.ghost.danger:hover { border-color: var(--offline); color: var(--offline); }
+
+  .modlist-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .modlist-bar select { flex: 1 1 220px; min-width: 0; }
+  .modlist-bar .btn-save { margin: 0; flex: 0 0 auto; }
+  #modlist-text {
+    width: 100%; min-height: 320px; background: var(--bg); border: 1px solid var(--border);
+    color: var(--text); font-family: 'Roboto Mono', monospace; font-size: 12px;
+    line-height: 1.5; padding: 12px; resize: vertical; outline: none; tab-size: 2;
+  }
+  #modlist-text:focus { border-color: var(--accent); }
+  .modlist-hint { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.6; }
+  .modlist-hint code { font-family: 'Roboto Mono', monospace; color: var(--text); }
 
   .restart-notice {
     display: none; margin-top: 10px;
@@ -553,58 +569,24 @@
     <div class="restart-notice" id="restart-notice">⚠ Zmiany zostaną zastosowane po restarcie serwera</div>
   </div>
 
-  <!-- Mods -->
+  <!-- Mod lists -->
   <div class="card" style="animation-delay:0.18s">
-    <div class="card-label">Server Mods</div>
-
-    <!-- Lista aktywnych modów -->
-    <div id="mods-list" style="margin-bottom:16px;display:flex;flex-direction:column;gap:8px;">
-      <div style="color:var(--muted);font-size:13px">Loading mods...</div>
+    <div class="card-label">Mod Lists</div>
+    <div class="modlist-bar">
+      <select id="modlist-select" class="field-input" onchange="selectModlist(this.value)" aria-label="Mod list"></select>
+      <button class="btn-save" id="btn-modlist-save" type="button" onclick="saveModlist()">Save</button>
+      <button class="btn-save ghost" type="button" onclick="saveModlistAs()">Save as new…</button>
+      <button class="btn-save ghost danger" id="btn-modlist-delete" type="button" onclick="deleteModlist()">Delete</button>
     </div>
-
-    <!-- Bulk import (paste JSON or upload file) -->
-    <div style="border-top:1px solid var(--border);padding-top:16px;margin-top:4px;">
-      <div style="font-size:10px;font-weight:600;letter-spacing:0.2em;text-transform:uppercase;color:var(--muted);margin-bottom:12px;">Bulk import</div>
-      <textarea id="mods-import-text" rows="6" maxlength="200000" placeholder='[
+    <textarea id="modlist-text" spellcheck="false" maxlength="2000000" oninput="modlistDirty = true"
+              placeholder='[
   { "modId": "595F2BF2F44836FB", "name": "RHS - Status Quo", "version": "0.14.4899" }
-]' style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);font-family:'JetBrains Mono',monospace;font-size:11.5px;padding:10px;line-height:1.5;resize:vertical;outline:none;"></textarea>
-      <div style="display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap;">
-        <select id="mods-import-mode" class="field-input" style="min-width:180px;">
-          <option value="replace">Replace full list</option>
-          <option value="merge">Merge with existing</option>
-        </select>
-        <button class="btn-save" type="button" onclick="importModsFromTextarea()" style="margin:0;flex:0 0 auto;">Import pasted JSON</button>
-        <label class="btn-save" style="margin:0;cursor:pointer;flex:0 0 auto;background:transparent;border:1px solid var(--border);color:var(--text);">
-          Upload .json file
-          <input type="file" id="mods-import-file" accept="application/json,.json" onchange="importModsFromFile(this)" style="display:none;" />
-        </label>
-      </div>
-      <div style="font-size:10.5px;color:var(--muted);margin-top:8px;line-height:1.5;">
-        Format: a JSON array of <code>{ "modId": "&lt;hex&gt;", "name": "&lt;optional&gt;", "version": "&lt;optional&gt;" }</code>.
-        File limit 2 MB. Replace overwrites the whole mod list; merge adds missing entries only.
-      </div>
+]'></textarea>
+    <div class="modlist-hint">
+      The selected list replaces the <code>mods</code> array in config.json every time the server starts.
+      Format: a JSON array of <code>{ "modId": "…", "name": "…", "version": "…" }</code>; only <code>modId</code> is required.
     </div>
-
-    <!-- Single-add form -->
-    <div style="border-top:1px solid var(--border);padding-top:16px;margin-top:16px;">
-      <div style="font-size:10px;font-weight:600;letter-spacing:0.2em;text-transform:uppercase;color:var(--muted);margin-bottom:12px;">Add a single mod</div>
-      <div class="config-grid">
-        <div class="field-group">
-          <label for="mod-id">Mod ID <span style="color:var(--offline)">*</span></label>
-          <input type="text" id="mod-id" placeholder="e.g. 595F2BF2F44836FB" maxlength="64" />
-        </div>
-        <div class="field-group">
-          <label for="mod-name">Name <span style="color:var(--offline)">*</span></label>
-          <input type="text" id="mod-name" placeholder="e.g. RHS - Status Quo" maxlength="128" />
-        </div>
-        <div class="field-group">
-          <label for="mod-version">Version (optional)</label>
-          <input type="text" id="mod-version" placeholder="e.g. 0.14.4795" maxlength="32" />
-        </div>
-      </div>
-      <button class="btn-save" onclick="addMod()" id="btn-add-mod">Add mod</button>
-      <div class="restart-notice" id="mods-restart-notice">⚠ Mod changes will be applied after server restart</div>
-    </div>
+    <div class="restart-notice" id="mods-restart-notice">⚠ Mod changes will be applied after server restart</div>
   </div>
 
   <!-- Persistence -->
@@ -689,21 +671,6 @@ async function postJson(url, body) {
     // CSRF expired — refresh token and surface error
     try { const cr = await fetch('/api/csrf'); if (cr.ok) CSRF = (await cr.json()).csrf || ''; } catch(e) {}
   }
-  return r;
-}
-
-async function postForm(url, formData) {
-  if (!CSRF) {
-    try { const r = await fetch('/api/csrf'); if (r.ok) CSRF = (await r.json()).csrf || ''; }
-    catch(e) {}
-  }
-  formData.append('_csrf', CSRF);
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { 'X-CSRF-Token': CSRF },
-    body: formData,
-  });
-  if (r.status === 401) { window.location.href = '/login'; throw new Error('unauthorized'); }
   return r;
 }
 
@@ -909,9 +876,6 @@ function updateUI(d) {
 
   if (d.csrf) CSRF = d.csrf;
   renderMissionSelect(d.missions || [], d.missions_count, d.scenario_id);
-
-  // Render listy modów
-  renderMods(d.mods || []);
 }
 
 function renderMissionSelect(missions, counts, currentId) {
@@ -933,10 +897,11 @@ function renderMissionSelect(missions, counts, currentId) {
   sourceKeys.forEach(src => {
     const og = document.createElement('optgroup');
     og.label = src === 'vanilla' ? 'Base game' : src;
-    groups[src].forEach(m => {
+    groups[src].sort((a, b) => a.id.localeCompare(b.id)).forEach(m => {
       const opt = document.createElement('option');
       opt.value = m.id;
-      opt.textContent = m.name;
+      opt.textContent = m.id;
+      opt.title = m.name;
       og.appendChild(opt);
     });
     sel.appendChild(og);
@@ -978,129 +943,118 @@ async function rescanScenarios() {
   if (btn) btn.disabled = false;
 }
 
-function renderMods(mods) {
-  const container = document.getElementById('mods-list');
-  if (mods.length === 0) {
-    container.innerHTML = '<div style="color:var(--muted);font-size:13px;font-style:italic">Brak zainstalowanych modów</div>';
-    return;
-  }
-  container.innerHTML = '';
-  mods.forEach(mod => {
-    const row = document.createElement('div');
-    row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 14px;background:var(--bg);border:1px solid var(--border)';
-    row.innerHTML = `
-      <div style="display:flex;flex-direction:column;gap:3px;min-width:0">
-        <div style="font-family:\'Barlow Condensed\',sans-serif;font-weight:700;font-size:15px;color:#fff;letter-spacing:0.04em">${escHtml(mod.name)}</div>
-        <div style="display:flex;gap:12px;align-items:center">
-          <span style="font-size:11px;color:var(--muted);font-family:\'JetBrains Mono\',monospace">${escHtml(mod.modId)}</span>
-          ${mod.version ? `<span style="font-size:11px;color:var(--accent);letter-spacing:0.05em">v${escHtml(mod.version)}</span>` : ''}
-        </div>
-      </div>
-      <button onclick="removeMod('${escHtml(mod.modId)}')" style="
-        background:transparent;border:1px solid var(--border);color:var(--muted);
-        font-family:\'Barlow Condensed\',sans-serif;font-size:11px;letter-spacing:0.15em;
-        text-transform:uppercase;padding:5px 12px;cursor:pointer;flex-shrink:0;
-        transition:all 0.2s;white-space:nowrap
-      " onmouseover="this.style.borderColor='var(--offline)';this.style.color='var(--offline)'"
-         onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--muted)'">
-        Remove ✕
-      </button>`;
-    container.appendChild(row);
-  });
-}
-
 function escHtml(str) {
   return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-async function addMod() {
-  const modId   = document.getElementById('mod-id').value.trim();
-  const modName = document.getElementById('mod-name').value.trim();
-  const modVer  = document.getElementById('mod-version').value.trim();
-  if (!modId)   { setLog('Mod ID is required', 'error'); return; }
-  if (!modName) { setLog('Mod name is required', 'error'); return; }
-  document.getElementById('btn-add-mod').disabled = true;
-  setLog('Adding mod…', 'info');
-  try {
-    const r = await postJson('/api/mods/add', { modId, name: modName, version: modVer });
-    const d = await r.json();
-    if (d.ok) {
-      setLog(`Mod "${modName}" added`, 'ok');
-      document.getElementById('mod-id').value = '';
-      document.getElementById('mod-name').value = '';
-      document.getElementById('mod-version').value = '';
-      document.getElementById('mods-restart-notice').classList.toggle('visible', d.restart_required);
-      await fetchStatus();
-    } else {
-      setLog('Error: ' + (d.error || 'unknown'), 'error');
-    }
-  } catch(e) { setLog('Connection error', 'error'); }
-  document.getElementById('btn-add-mod').disabled = false;
-}
+// ─── Mod lists ───────────────────────────────────────────────────────────────
+let modlistLoaded = null;   // name of the list shown in the editor
+let modlistDirty = false;   // editor has unsaved changes
 
-async function removeMod(modId) {
-  if (!confirm('Remove this mod from the configuration?')) return;
-  setLog('Removing mod…', 'info');
-  try {
-    const r = await postJson('/api/mods/remove', { modId });
-    const d = await r.json();
-    if (d.ok) {
-      setLog('Mod removed', 'ok');
-      document.getElementById('mods-restart-notice').classList.toggle('visible', d.restart_required);
-      await fetchStatus();
-    } else {
-      setLog('Error: ' + (d.error || 'unknown'), 'error');
-    }
-  } catch(e) { setLog('Connection error', 'error'); }
-}
-
-// ─── Bulk import (paste or file upload) ──────────────────────────────────────
-async function importModsFromTextarea() {
-  const txt = document.getElementById('mods-import-text').value;
-  if (!txt.trim()) { setLog('Paste a JSON array first', 'error'); return; }
-  const mode = document.getElementById('mods-import-mode').value;
-  await _importMods({ payload: txt, mode });
-}
-
-async function importModsFromFile(input) {
-  const f = input.files && input.files[0];
-  if (!f) return;
-  if (f.size > 2 * 1024 * 1024) { setLog('File too large (max 2 MB)', 'error'); return; }
-  const mode = document.getElementById('mods-import-mode').value;
-  setLog(`Uploading ${f.name}…`, 'info');
-  const fd = new FormData();
-  fd.append('file', f, f.name);
-  fd.append('mode', mode);
-  try {
-    const r = await postForm('/api/mods/import', fd);
-    const d = await r.json();
-    _afterImport(d);
-  } catch(e) { setLog('Upload error', 'error'); }
-  input.value = '';
-}
-
-async function _importMods(body) {
-  setLog('Importing mods…', 'info');
-  try {
-    const r = await postJson('/api/mods/import', body);
-    const d = await r.json();
-    _afterImport(d);
-  } catch(e) { setLog('Connection error', 'error'); }
-}
-
-function _afterImport(d) {
-  if (d.ok) {
-    let msg = d.message || `${d.imported} mods imported`;
-    if (d.skipped && d.skipped.length) {
-      msg += ` (${d.skipped.length} skipped: ${d.skipped.slice(0, 3).join('; ')}${d.skipped.length > 3 ? '…' : ''})`;
-    }
-    setLog(msg, 'ok');
-    document.getElementById('mods-import-text').value = '';
-    document.getElementById('mods-restart-notice').classList.toggle('visible', d.restart_required);
-    fetchStatus();
-  } else {
-    setLog('Import failed: ' + (d.error || 'unknown'), 'error');
+function renderModlistSelect(lists, selected) {
+  const sel = document.getElementById('modlist-select');
+  sel.innerHTML = '';
+  if (!lists.length) {
+    const opt = document.createElement('option');
+    opt.textContent = 'No mod lists yet — use "Save as new…"';
+    opt.value = '';
+    sel.appendChild(opt);
   }
+  lists.forEach(name => {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    sel.appendChild(opt);
+  });
+  sel.value = selected || '';
+  document.getElementById('btn-modlist-delete').disabled = !selected;
+}
+
+function modlistNotice(d) {
+  document.getElementById('mods-restart-notice').classList.toggle('visible', !!d.restart_required);
+}
+
+async function fetchModlists() {
+  try {
+    const r = await fetch('/api/modlists');
+    if (r.status === 401) { window.location.href = '/login'; return; }
+    const d = await r.json();
+    renderModlistSelect(d.lists, d.selected);
+    if (d.selected) {
+      await loadModlist(d.selected);
+    } else {
+      modlistLoaded = null;
+      modlistDirty = false;
+      document.getElementById('modlist-text').value = '';
+    }
+  } catch(e) { setLog('Could not load mod lists', 'error'); }
+}
+
+async function loadModlist(name) {
+  const r = await fetch('/api/modlists/get?name=' + encodeURIComponent(name));
+  if (r.status === 401) { window.location.href = '/login'; return; }
+  const d = await r.json();
+  if (!d.ok) { setLog('Error: ' + (d.error || 'unknown'), 'error'); return; }
+  document.getElementById('modlist-text').value = d.text;
+  modlistLoaded = d.name;
+  modlistDirty = false;
+}
+
+async function selectModlist(name) {
+  const sel = document.getElementById('modlist-select');
+  if (modlistDirty && !confirm(`Discard unsaved changes to "${modlistLoaded}"?`)) {
+    sel.value = modlistLoaded || '';
+    return;
+  }
+  try {
+    const r = await postJson('/api/modlists/select', { name });
+    const d = await r.json();
+    if (!d.ok) { setLog('Error: ' + (d.error || 'unknown'), 'error'); sel.value = modlistLoaded || ''; return; }
+    renderModlistSelect(d.lists, d.selected);
+    await loadModlist(d.selected);
+    modlistNotice(d);
+    setLog(`Mod list "${d.selected}" selected; it is used the next time the server starts`, 'ok');
+  } catch(e) { setLog('Connection error', 'error'); }
+}
+
+async function _saveModlist(name, create) {
+  const text = document.getElementById('modlist-text').value;
+  try {
+    const r = await postJson('/api/modlists/save', { name, text, create });
+    const d = await r.json();
+    if (!d.ok) { setLog('Error: ' + (d.error || 'unknown'), 'error'); return; }
+    renderModlistSelect(d.lists, d.selected);
+    if (create) await loadModlist(d.name);
+    else modlistDirty = false;
+    modlistNotice(d);
+    setLog(`Mod list "${d.name}" saved (${d.count} mod${d.count === 1 ? '' : 's'})`, 'ok');
+  } catch(e) { setLog('Connection error', 'error'); }
+}
+
+function saveModlist() {
+  if (!modlistLoaded) return saveModlistAs();
+  return _saveModlist(modlistLoaded, false);
+}
+
+function saveModlistAs() {
+  const name = prompt('Name for the new mod list (letters, numbers, spaces and _ . ( ) -):', '');
+  if (name === null || !name.trim()) return;
+  if (!document.getElementById('modlist-text').value.trim()) document.getElementById('modlist-text').value = '[]';
+  return _saveModlist(name.trim(), true);
+}
+
+async function deleteModlist() {
+  if (!modlistLoaded) return;
+  if (!confirm(`Delete the mod list "${modlistLoaded}"? This cannot be undone.`)) return;
+  try {
+    const r = await postJson('/api/modlists/delete', { name: modlistLoaded });
+    const d = await r.json();
+    if (!d.ok) { setLog('Error: ' + (d.error || 'unknown'), 'error'); return; }
+    setLog(`Mod list "${modlistLoaded}" deleted`, 'ok');
+    modlistDirty = false;
+    modlistNotice(d);
+    await fetchModlists();
+  } catch(e) { setLog('Connection error', 'error'); }
 }
 
 function setLog(msg, type = 'info') {
@@ -1294,7 +1248,7 @@ function startCountdown() {
   }, 1000);
 }
 
-fetchStatus().then(() => { fetchPersistence(); startCountdown(); });
+fetchStatus().then(() => { fetchPersistence(); fetchModlists(); startCountdown(); });
 
 // PWA — rejestracja service workera
 if ('serviceWorker' in navigator) {
