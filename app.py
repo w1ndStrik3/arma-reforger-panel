@@ -1327,7 +1327,8 @@ def api_start():
 # These can take minutes (the server writes its save before exiting), so they
 # run in a background thread; /api/status reports progress under "lifecycle".
 #   stop          ask the server to save and exit
-#   restart       hard: kill the server and start it again (no save first)
+#   hard-reset    kill the server without saving, delete the world and player
+#                 saves, and start it again on a fresh world
 #   soft-restart  ask the server to save and exit, then start it again; the
 #                 launch always passes -loadSessionSave, so it resumes from
 #                 that save
@@ -1343,9 +1344,10 @@ def _wait_for_exit(proc, what):
 
 def _run_lifecycle(action, proc):
     error = None
+    removed = None
     try:
         try:
-            if proc is not None and action == "restart":
+            if proc is not None and action == "hard-reset":
                 _LIFECYCLE["phase"] = "stopping"
                 proc.terminate()  # SIGTERM on Linux, an immediate kill on Windows
                 try:
@@ -1359,12 +1361,19 @@ def _run_lifecycle(action, proc):
                 _wait_for_exit(proc, "save and exit")
         except psutil.NoSuchProcess:
             pass  # it exited on its own in the meantime
+        if action == "hard-reset":
+            # Without this the relaunch (-loadSessionSave) would just resume
+            # from the last autosave, making it no different from a soft restart.
+            _LIFECYCLE["phase"] = "flushing"
+            removed = _flush_saves()
         if action != "stop":
             _LIFECYCLE["phase"] = "starting"
             launch_server()
+            time.sleep(1)  # let the new process show up before reporting done
     except Exception as e:
         error = str(e)
-    _LIFECYCLE["last"] = {"action": action, "ok": error is None, "error": error, "ts": int(time.time())}
+    _LIFECYCLE["last"] = {"action": action, "ok": error is None, "error": error,
+                          "removed": removed, "ts": int(time.time())}
     _LIFECYCLE["phase"] = None
     _LIFECYCLE["action"] = None
 
@@ -1388,9 +1397,9 @@ def _begin_lifecycle(action, require_running):
 def api_stop():
     return _begin_lifecycle("stop", require_running=True)
 
-@app.route("/api/restart", methods=["POST"])
-def api_restart():
-    return _begin_lifecycle("restart", require_running=False)
+@app.route("/api/hard-reset", methods=["POST"])
+def api_hard_reset():
+    return _begin_lifecycle("hard-reset", require_running=False)
 
 @app.route("/api/soft-restart", methods=["POST"])
 def api_soft_restart():

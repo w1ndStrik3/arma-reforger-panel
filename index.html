@@ -503,8 +503,9 @@
     <button class="ctrl-btn stop" id="btn-stop" onclick="serverAction('stop')" disabled>
       <span class="ctrl-icon">■</span>STOP
     </button>
-    <button class="ctrl-btn reset" id="btn-reset" onclick="serverAction('restart')" disabled>
-      <span class="ctrl-icon">↺</span>RESTART
+    <button class="ctrl-btn reset" id="btn-reset" onclick="serverAction('hard-reset')" disabled
+            title="Kill the server without saving, delete the world and player saves, and start a fresh world">
+      <span class="ctrl-icon">↺</span>HARD RESET
     </button>
     <button class="ctrl-btn soft" id="btn-soft" onclick="serverAction('soft-restart')" disabled
             title="Save the game state, stop the server and start it again from that save">
@@ -1075,6 +1076,7 @@ function setBusy(state) {
 const LIFECYCLE_PHASES = {
   saving:   'Saving game state, waiting for the server to exit...',
   stopping: 'Stopping server...',
+  flushing: 'Deleting saves...',
   starting: 'Starting server...',
 };
 
@@ -1094,10 +1096,13 @@ async function waitForLifecycle() {
 }
 
 async function serverAction(action) {
-  const labels = { start: 'Uruchamianie serwera...', stop: 'Zatrzymywanie serwera...', restart: 'Restartowanie serwera...',
+  const labels = { start: 'Uruchamianie serwera...', stop: 'Zatrzymywanie serwera...',
+                   'hard-reset': 'Hard reset: stopping server...',
                    'soft-restart': 'Saving game state and restarting...' };
-  const success = { start: 'Serwer uruchomiony', stop: 'Serwer zatrzymany', restart: 'Serwer zrestartowany',
+  const success = { start: 'Serwer uruchomiony', stop: 'Serwer zatrzymany',
+                    'hard-reset': 'Server reset to a fresh world',
                     'soft-restart': 'Server restarted from the saved game state' };
+  if (action === 'hard-reset' && !confirm('Hard reset kills the server WITHOUT saving, deletes the world and player saves (.save/game and .save/playersave), and starts a fresh world. This cannot be undone. Continue?')) return;
   setBusy(true);
   setLog(labels[action], 'info');
   try {
@@ -1111,6 +1116,8 @@ async function serverAction(action) {
       if (last === null) return;
       if (last && !last.ok) {
         setLog('Błąd: ' + (last.error || 'nieznany'), 'error');
+      } else if (action === 'hard-reset') {
+        setLog(`${success[action]} (${last.removed || 0} save file${last.removed === 1 ? '' : 's'} deleted)`, 'ok');
       } else if (action === 'soft-restart' && !d.persistence) {
         setLog('Server restarted, but persistence is off in config.json, so there may be no save to load', 'error');
       } else {
