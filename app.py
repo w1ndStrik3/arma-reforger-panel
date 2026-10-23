@@ -874,6 +874,33 @@ def _flush_saves():
                 pass
     return removed
 
+def _archive_saves():
+    """Move the contents of `.save/game/` and `.save/playersave/` into
+    `PROFILE_DIR/save-archive/<timestamp>/` so the next launch finds no save
+    and starts a fresh world. Nothing is deleted; moving a folder back restores
+    that world. Returns (files moved, archive path or None if nothing to move).
+    Raises if a file can't be moved, so a half-moved save is never launched."""
+    import shutil
+    root = _save_root()
+    entries = [(sub, name) for sub in _FLUSHABLE_SUBDIRS
+               if os.path.isdir(os.path.join(root, sub))
+               for name in os.listdir(os.path.join(root, sub))]
+    if not entries:
+        return 0, None
+    archive = os.path.join(PROFILE_DIR, "save-archive", time.strftime("%Y-%m-%d_%H-%M-%S"))
+    while os.path.exists(archive):
+        archive += "_"
+    moved = 0
+    for sub, name in entries:
+        src = os.path.join(root, sub, name)
+        if os.path.isdir(src):
+            moved += sum(len(files) for _dp, _dn, files in os.walk(src))
+        else:
+            moved += 1
+        os.makedirs(os.path.join(archive, sub), exist_ok=True)
+        shutil.move(src, os.path.join(archive, sub, name))
+    return moved, archive
+
 
 def get_map_name(cfg=None):
     """The scenario's resource name, e.g. {0648CDB32D6B02B3}Missions/SP02_AirSupport.conf."""
@@ -1330,8 +1357,10 @@ def api_start():
 # These can take minutes (the server writes its save before exiting), so they
 # run in a background thread; /api/status reports progress under "lifecycle".
 #   stop          ask the server to save and exit
-#   hard-reset    kill the server without saving and start it again without
-#                 -loadSessionSave, so it begins a fresh world
+#   hard-reset    kill the server without saving, move its saves into an
+#                 archive folder and start it again on a fresh world (the server
+#                 resumes a saved session even without -loadSessionSave, so the
+#                 saves have to be out of the way)
 #   soft-restart  ask the server to save and exit, then start it again; the
 #                 launch always passes -loadSessionSave, so it resumes from
 #                 that save
@@ -1347,6 +1376,7 @@ def _wait_for_exit(proc, what):
 
 def _run_lifecycle(action, proc):
     error = None
+    archived = None
     try:
         try:
             if proc is not None and action == "hard-reset":
@@ -1363,13 +1393,18 @@ def _run_lifecycle(action, proc):
                 _wait_for_exit(proc, "save and exit")
         except psutil.NoSuchProcess:
             pass  # it exited on its own in the meantime
+        if action == "hard-reset":
+            _LIFECYCLE["phase"] = "archiving"
+            count, path = _archive_saves()
+            archived = {"count": count, "path": path, "save_root": _save_root()}
         if action != "stop":
             _LIFECYCLE["phase"] = "starting"
             launch_server(load_save=action != "hard-reset")
             time.sleep(1)  # let the new process show up before reporting done
     except Exception as e:
         error = str(e)
-    _LIFECYCLE["last"] = {"action": action, "ok": error is None, "error": error, "ts": int(time.time())}
+    _LIFECYCLE["last"] = {"action": action, "ok": error is None, "error": error,
+                          "archived": archived, "ts": int(time.time())}
     _LIFECYCLE["phase"] = None
     _LIFECYCLE["action"] = None
 
