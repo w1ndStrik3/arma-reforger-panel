@@ -504,7 +504,7 @@
       <span class="ctrl-icon">■</span>STOP
     </button>
     <button class="ctrl-btn reset" id="btn-reset" onclick="serverAction('hard-reset')" disabled
-            title="Kill the server without saving, move its saves to an archive folder, and start a fresh world">
+            title="Kill the server without saving, move the session save to an archive folder, and start a fresh world">
       <span class="ctrl-icon">↺</span>HARD RESET
     </button>
     <button class="ctrl-btn soft" id="btn-soft" onclick="serverAction('soft-restart')" disabled
@@ -1076,7 +1076,7 @@ function setBusy(state) {
 const LIFECYCLE_PHASES = {
   saving:   'Saving game state, waiting for the server to exit...',
   stopping: 'Stopping server...',
-  archiving: 'Moving saves to the archive folder...',
+  archiving: 'Moving the session save to the archive folder...',
   starting: 'Starting server...',
 };
 
@@ -1102,7 +1102,7 @@ async function serverAction(action) {
   const success = { start: 'Serwer uruchomiony', stop: 'Serwer zatrzymany',
                     'hard-reset': 'Server reset to a fresh world',
                     'soft-restart': 'Server restarted from the saved game state' };
-  if (action === 'hard-reset' && !confirm('Hard reset kills the server WITHOUT saving, moves the current world and player saves to an archive folder (save-archive in the profile folder), and starts a fresh world. Continue?')) return;
+  if (action === 'hard-reset' && !confirm('Hard reset kills the server WITHOUT saving, moves the current session save to an archive folder (save-archive in the profile folder), and starts a fresh world. Player saves are kept. Continue?')) return;
   setBusy(true);
   setLog(labels[action], 'info');
   try {
@@ -1119,7 +1119,7 @@ async function serverAction(action) {
       } else if (action === 'hard-reset') {
         const a = last.archived || {};
         if (a.count) setLog(`${success[action]}; ${a.count} save file${a.count === 1 ? '' : 's'} moved to ${a.path}`, 'ok');
-        else setLog(`Server restarted, but no saves were found in ${a.save_root || 'the save folder'}; if the old world still loads, set PROFILE_DIR in config.env`, 'error');
+        else setLog(`Server restarted, but no session save was found in ${a.save_root || 'the save folder'}; if the old world still loads, set PROFILE_DIR in config.env`, 'error');
       } else if (action === 'soft-restart' && !d.persistence) {
         setLog('Server restarted, but persistence is off in config.json, so there may be no save to load', 'error');
       } else {

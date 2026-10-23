@@ -874,15 +874,16 @@ def _flush_saves():
                 pass
     return removed
 
-def _archive_saves():
-    """Move the contents of `.save/game/` and `.save/playersave/` into
-    `PROFILE_DIR/save-archive/<timestamp>/` so the next launch finds no save
-    and starts a fresh world. Nothing is deleted; moving a folder back restores
-    that world. Returns (files moved, archive path or None if nothing to move).
+def _archive_session_save():
+    """Move the world session save (the contents of `.save/game/`) into
+    `PROFILE_DIR/save-archive/<timestamp>/game/` so the next launch finds no
+    session and starts a fresh world. Player saves and settings stay where
+    they are, and nothing is deleted; moving the folder back restores that
+    world. Returns (files moved, archive path or None if nothing to move).
     Raises if a file can't be moved, so a half-moved save is never launched."""
     import shutil
     root = _save_root()
-    entries = [(sub, name) for sub in _FLUSHABLE_SUBDIRS
+    entries = [(sub, name) for sub in ("game",)
                if os.path.isdir(os.path.join(root, sub))
                for name in os.listdir(os.path.join(root, sub))]
     if not entries:
@@ -1357,10 +1358,10 @@ def api_start():
 # These can take minutes (the server writes its save before exiting), so they
 # run in a background thread; /api/status reports progress under "lifecycle".
 #   stop          ask the server to save and exit
-#   hard-reset    kill the server without saving, move its saves into an
+#   hard-reset    kill the server without saving, move the session save into an
 #                 archive folder and start it again on a fresh world (the server
 #                 resumes a saved session even without -loadSessionSave, so the
-#                 saves have to be out of the way)
+#                 session has to be out of the way); player saves stay put
 #   soft-restart  ask the server to save and exit, then start it again; the
 #                 launch always passes -loadSessionSave, so it resumes from
 #                 that save
@@ -1395,7 +1396,7 @@ def _run_lifecycle(action, proc):
             pass  # it exited on its own in the meantime
         if action == "hard-reset":
             _LIFECYCLE["phase"] = "archiving"
-            count, path = _archive_saves()
+            count, path = _archive_session_save()
             archived = {"count": count, "path": path, "save_root": _save_root()}
         if action != "stop":
             _LIFECYCLE["phase"] = "starting"
