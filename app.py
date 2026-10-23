@@ -92,12 +92,15 @@ SHUTDOWN_TIMEOUT = int(_cfg.get("SHUTDOWN_TIMEOUT", 180))
 # Small helper that delivers Ctrl+C to the server's console on Windows.
 _CTRL_C_HELPER = os.path.join(_BASE_DIR, "win_ctrl_c.py")
 
-def build_server_args():
-    """Build the launch arguments. `-loadSessionSave` is always passed: with no
-    save files it's a no-op, and including it keeps panel-launched and
-    systemd-launched starts behaving the same way. The 'enabled' toggle in the
-    UI controls only the `persistence` block in config.json (autosave)."""
-    args = ["-config", SERVER_CONFIG, "-loadSessionSave"]
+def build_server_args(load_save=True):
+    """Build the launch arguments. `-loadSessionSave` is passed on every launch
+    except a hard reset: with no save files it's a no-op, and including it
+    keeps panel-launched and systemd-launched starts behaving the same way.
+    The 'enabled' toggle in the UI controls only the `persistence` block in
+    config.json (autosave)."""
+    args = ["-config", SERVER_CONFIG]
+    if load_save:
+        args.append("-loadSessionSave")
     if MAX_FPS:
         args.append(f"-maxFPS={MAX_FPS}")
     return args
@@ -714,15 +717,15 @@ def tail_lines(path, n):
             data = f.read(step) + data
     return data.decode("utf-8", errors="replace").splitlines()[-n:]
 
-def launch_server():
+def launch_server(load_save=True):
     apply_selected_modlist()
+    args = [SERVER_BINARY] + build_server_args(load_save)
     if IS_WINDOWS:
         # Give the server its own console, as if started by hand, so the panel
         # can later send it Ctrl+C for a clean save-and-exit.
-        subprocess.Popen([SERVER_BINARY] + build_server_args(), cwd=SERVER_DIR,
-                         creationflags=subprocess.CREATE_NEW_CONSOLE)
+        subprocess.Popen(args, cwd=SERVER_DIR, creationflags=subprocess.CREATE_NEW_CONSOLE)
     else:
-        subprocess.Popen([SERVER_BINARY] + build_server_args(), cwd=SERVER_DIR,
+        subprocess.Popen(args, cwd=SERVER_DIR,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
 
@@ -1327,8 +1330,8 @@ def api_start():
 # These can take minutes (the server writes its save before exiting), so they
 # run in a background thread; /api/status reports progress under "lifecycle".
 #   stop          ask the server to save and exit
-#   hard-reset    kill the server without saving, delete the world and player
-#                 saves, and start it again on a fresh world
+#   hard-reset    kill the server without saving and start it again without
+#                 -loadSessionSave, so it begins a fresh world
 #   soft-restart  ask the server to save and exit, then start it again; the
 #                 launch always passes -loadSessionSave, so it resumes from
 #                 that save
@@ -1344,7 +1347,6 @@ def _wait_for_exit(proc, what):
 
 def _run_lifecycle(action, proc):
     error = None
-    removed = None
     try:
         try:
             if proc is not None and action == "hard-reset":
@@ -1361,19 +1363,13 @@ def _run_lifecycle(action, proc):
                 _wait_for_exit(proc, "save and exit")
         except psutil.NoSuchProcess:
             pass  # it exited on its own in the meantime
-        if action == "hard-reset":
-            # Without this the relaunch (-loadSessionSave) would just resume
-            # from the last autosave, making it no different from a soft restart.
-            _LIFECYCLE["phase"] = "flushing"
-            removed = _flush_saves()
         if action != "stop":
             _LIFECYCLE["phase"] = "starting"
-            launch_server()
+            launch_server(load_save=action != "hard-reset")
             time.sleep(1)  # let the new process show up before reporting done
     except Exception as e:
         error = str(e)
-    _LIFECYCLE["last"] = {"action": action, "ok": error is None, "error": error,
-                          "removed": removed, "ts": int(time.time())}
+    _LIFECYCLE["last"] = {"action": action, "ok": error is None, "error": error, "ts": int(time.time())}
     _LIFECYCLE["phase"] = None
     _LIFECYCLE["action"] = None
 
