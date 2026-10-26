@@ -924,9 +924,9 @@ def get_map_name(cfg=None):
 #  (min, max) for numbers, value the server uses when the key is absent).
 _GAME_SETTINGS = {
     "max_players":               ("Max players",                "game",           "maxPlayers",                 int,  (1, 128),     64),
-    "server_max_view_distance":  ("Server max view distance",   "gameProperties", "serverMaxViewDistance",      int,  (500, 10000), 1600),
+    "server_max_view_distance":  ("Server max view distance",   "gameProperties", "serverMaxViewDistance",      int,  (500, 12000), 1600),
     "network_view_distance":     ("Network view distance",      "gameProperties", "networkViewDistance",        int,  (500, 5000),  1500),
-    "server_min_grass_distance": ("Server min grass distance",  "gameProperties", "serverMinGrassDistance",     int,  (0, 150),     0),
+    "server_min_grass_distance": ("Server min grass distance",  "gameProperties", "serverMinGrassDistance",     int,  (50, 150),    50),
     "disable_third_person":      ("Disable third person",       "gameProperties", "disableThirdPerson",         bool, None,         False),
     "von_cross_faction":         ("Cross-faction voice (VON)",  "gameProperties", "VONCanTransmitCrossFaction", bool, None,         False),
 }
