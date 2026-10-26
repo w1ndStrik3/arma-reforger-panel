@@ -904,10 +904,64 @@ def _archive_session_save():
 
 
 def get_map_name(cfg=None):
-    """The scenario's resource name, e.g. {0648CDB32D6B02B3}Missions/SP02_AirSupport.conf."""
-    if cfg is None:
-        cfg = read_config()
-    return cfg.get("game", {}).get("scenarioId", "") or "Unknown"
+    try:
+        if cfg is None:
+            cfg = read_config()
+        sid = cfg.get("game", {}).get("scenarioId", "")
+        if not sid:
+            return "Unknown"
+        # Consult the full merged list (vanilla + discovered, with overrides
+        # already applied) so the dashboard tile matches the dropdown.
+        for m in all_scenarios_cached():
+            if m["id"] == sid:
+                return m["name"]
+        return sid.split("/")[-1].replace(".conf", "")
+    except Exception:
+        return "Unknown"
+
+# Server and gameplay settings edited from the panel. Each entry: request key ->
+# (label, section ("game" or "gameProperties"), config.json key, type,
+#  (min, max) for numbers, value the server uses when the key is absent).
+_GAME_SETTINGS = {
+    "max_players":               ("Max players",                "game",           "maxPlayers",                 int,  (1, 128),     64),
+    "server_max_view_distance":  ("Server max view distance",   "gameProperties", "serverMaxViewDistance",      int,  (500, 10000), 1600),
+    "network_view_distance":     ("Network view distance",      "gameProperties", "networkViewDistance",        int,  (500, 5000),  1500),
+    "server_min_grass_distance": ("Server min grass distance",  "gameProperties", "serverMinGrassDistance",     int,  (0, 150),     0),
+    "disable_third_person":      ("Disable third person",       "gameProperties", "disableThirdPerson",         bool, None,         False),
+    "von_cross_faction":         ("Cross-faction voice (VON)",  "gameProperties", "VONCanTransmitCrossFaction", bool, None,         False),
+}
+
+def _settings_section(cfg, section):
+    game = cfg.setdefault("game", {})
+    return game if section == "game" else game.setdefault("gameProperties", {})
+
+def get_game_settings(cfg):
+    return {k: _settings_section(cfg, section).get(key, default)
+            for k, (_label, section, key, _type, _range, default) in _GAME_SETTINGS.items()}
+
+def apply_game_settings(cfg, data):
+    """Copy the settings present in `data` into cfg. Returns (changed, error)."""
+    changed = False
+    for k, (label, section, key, typ, bounds, _default) in _GAME_SETTINGS.items():
+        if k not in data:
+            continue
+        value = data[k]
+        if typ is bool:
+            if not isinstance(value, bool):
+                return changed, f"{label} must be true or false"
+        else:
+            try:
+                if isinstance(value, bool):
+                    raise ValueError
+                value = int(value)
+            except (TypeError, ValueError):
+                return changed, f"{label} must be a whole number"
+            lo, hi = bounds
+            if not lo <= value <= hi:
+                return changed, f"{label} must be between {lo} and {hi}"
+        _settings_section(cfg, section)[key] = value
+        changed = True
+    return changed, None
 
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
 
@@ -987,6 +1041,7 @@ def api_status():
                            "from_mods": sum(1 for m in missions if m.get("source") != "vanilla")},
         "password":       cfg.get("game", {}).get("password", ""),
         "password_admin": cfg.get("game", {}).get("passwordAdmin", ""),
+        "settings":       get_game_settings(cfg),
         "cpu":            cpu,
         "ram_process":    ram,
         "ram_used":       ram_used,
@@ -1056,6 +1111,10 @@ def api_config():
         cfg.setdefault("game", {})["password"] = data["password"]; changed = True
     if "password_admin" in data and data["password_admin"].strip():
         cfg.setdefault("game", {})["passwordAdmin"] = data["password_admin"].strip(); changed = True
+    settings_changed, error = apply_game_settings(cfg, data)
+    if error:
+        return jsonify({"ok": False, "error": error})
+    changed = changed or settings_changed
     if not changed:
         return jsonify({"ok": False, "error": "No changes"})
     try:

@@ -14,9 +14,9 @@ A lightweight, self-hosted web panel for managing your **Arma Reforger dedicated
 - **Linux and Windows** — Runs on Ubuntu (with the installer) or on Windows Server (manual setup)
 - **Real-time monitoring** — Live CPU and RAM charts updated every 3 seconds
 - **Live log streaming** — Server console logs with colour-coded output (errors, warnings, network events)
-- **Mission selector** — Pick the scenario by its resource name (e.g. `{0648CDB32D6B02B3}Missions/SP02_AirSupport.conf`); vanilla scenarios plus any found in installed mods
+- **Mission selector** — Vanilla scenarios plus any found in installed mods; the selected scenario's resource name (e.g. `{0648CDB32D6B02B3}Missions/SP02_AirSupport.conf`) is shown under the dropdown
 - **Mod lists** — Keep several named mod lists, edit each as JSON, and pick one from a dropdown; the selected list is written into `config.json` every time the server starts
-- **Config editor** — Edit server name, scenario, passwords without touching the filesystem
+- **Config editor** — Edit server name, scenario, passwords, max players, view/grass distances, third person and cross-faction voice without touching the filesystem
 - **PWA support** — Installable as a native app on Android and iOS
 - **Single config file** — All settings in one `config.env`, no code editing required
 
