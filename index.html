@@ -33,6 +33,9 @@
     --warn:      #e0913a;
     --cpu-color: #4c9fd6;
     --ram-color: #c8a84b;
+    --fps-color: #4caf7d;
+    --down-color: #9b7fd6;
+    --up-color:  #e0913a;
   }
 
   body {
@@ -241,7 +244,7 @@
   /* Charts row */
   .charts-row {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 14px;
     margin-bottom: 14px;
     animation: fadeUp 0.4s ease 0.1s both;
@@ -268,12 +271,41 @@
 
   .chart-value.cpu  { color: var(--cpu-color); }
   .chart-value.ram  { color: var(--ram-color); }
+  .chart-value.fps  { color: var(--fps-color); }
+  .chart-value.net  { font-size: 15px; text-align: right; line-height: 1.3; }
+  .chart-value .down { color: var(--down-color); }
+  .chart-value .up   { color: var(--up-color); }
+  @media (max-width: 700px) { .charts-row { grid-template-columns: minmax(0, 1fr); } }
 
   .chart-sub {
     font-size: 11px; color: var(--muted); margin-top: 2px; text-align: right;
   }
 
   .chart-wrap { position: relative; height: 80px; }
+
+  /* Current status + timeline */
+  .stats-meta { font-size: 11px; color: var(--muted); margin-bottom: 12px; overflow-wrap: anywhere; }
+  .stats-meta.stale { color: var(--warn); }
+  .stat-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
+  .stat-tile { background: var(--bg); border: 1px solid var(--border); padding: 8px 10px; min-width: 0; }
+  .stat-tile .k { font-size: 9.5px; font-weight: 600; letter-spacing: 0.15em; text-transform: uppercase; color: var(--muted); }
+  .stat-tile .v { font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 18px; color: #fff; overflow-wrap: anywhere; }
+  .stat-group { margin-top: 12px; }
+  .stat-group .title { font-size: 9.5px; font-weight: 600; letter-spacing: 0.15em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+  .stat-row { display: flex; justify-content: space-between; gap: 12px; padding: 5px 10px; background: var(--bg); border: 1px solid var(--border); border-top: none; font-size: 13px; }
+  .stat-row:first-of-type { border-top: 1px solid var(--border); }
+  .stat-row .sub { font-family: 'Roboto Mono', monospace; font-size: 10.5px; color: var(--muted); overflow-wrap: anywhere; text-align: right; }
+  .timeline { max-height: 380px; overflow-y: auto; display: flex; flex-direction: column; }
+  .tl-row { display: grid; grid-template-columns: auto auto minmax(0, 1fr); gap: 10px; align-items: baseline; padding: 6px 2px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .tl-time { font-family: 'Roboto Mono', monospace; font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .tl-tag { font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 11px; letter-spacing: 0.12em; padding: 1px 6px; border: 1px solid currentColor; }
+  .tl-tag.join  { color: var(--online); }
+  .tl-tag.leave { color: var(--muted); }
+  .tl-tag.start { color: var(--accent); }
+  .tl-tag.stop  { color: var(--offline); }
+  .tl-text { overflow-wrap: anywhere; }
+  .tl-text .detail { color: var(--muted); font-size: 12px; }
+  .empty-note { color: var(--muted); font-size: 13px; font-style: italic; }
 
   /* Server settings + gameplay: two small cards side by side */
   .settings-row {
@@ -551,6 +583,39 @@
       </div>
       <div class="chart-wrap"><canvas id="chart-ram"></canvas></div>
     </div>
+    <div class="chart-card">
+      <div class="chart-header">
+        <div>
+          <div class="chart-title">FPS — Server</div>
+          <div class="chart-sub" id="fps-sub" style="text-align:left">from the stats file</div>
+        </div>
+        <div class="chart-value fps" id="fps-val">—</div>
+      </div>
+      <div class="chart-wrap"><canvas id="chart-fps"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-header">
+        <div>
+          <div class="chart-title">Network — System</div>
+          <div class="chart-sub" style="text-align:left"><span style="color:var(--down-color)">■</span> download &nbsp;<span style="color:var(--up-color)">■</span> upload</div>
+        </div>
+        <div class="chart-value net"><div class="down" id="net-down-val">↓ —</div><div class="up" id="net-up-val">↑ —</div></div>
+      </div>
+      <div class="chart-wrap"><canvas id="chart-net"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Current status + timeline -->
+  <div class="settings-row">
+    <div class="card" style="animation-delay:0.12s">
+      <div class="card-label">Current Status</div>
+      <div class="stats-meta" id="stats-meta">Loading…</div>
+      <div id="stats-body"></div>
+    </div>
+    <div class="card" style="animation-delay:0.13s">
+      <div class="card-label">Server Timeline</div>
+      <div class="timeline" id="timeline"><div class="empty-note">Loading…</div></div>
+    </div>
   </div>
 
   <!-- Config -->
@@ -755,7 +820,7 @@ function makeChartData(color) {
   };
 }
 
-const chartOpts = (max) => ({
+const chartOpts = (max, fmt = v => v + '%') => ({
   responsive: true,
   maintainAspectRatio: false,
   animation: false,
@@ -764,11 +829,11 @@ const chartOpts = (max) => ({
     x: { display: false },
     y: {
       display: true,
-      min: 0, max: max,
+      min: 0, max: max ?? undefined,
       grid: { color: '#1e253022', drawBorder: false },
       ticks: {
         color: '#5a6070', font: { size: 9 }, maxTicksLimit: 3,
-        callback: v => v + '%'
+        callback: fmt
       }
     }
   }
@@ -786,10 +851,36 @@ const ramChart = new Chart(document.getElementById('chart-ram'), {
   options: chartOpts(100)
 });
 
-function pushChart(chart, value) {
-  chart.data.datasets[0].data.push(value);
-  if (chart.data.datasets[0].data.length > MAX_POINTS)
-    chart.data.datasets[0].data.shift();
+const fpsChart = new Chart(document.getElementById('chart-fps'), {
+  type: 'line',
+  data: makeChartData('#4caf7d'),
+  options: chartOpts(null, v => v),
+});
+fpsChart.options.scales.y.suggestedMax = 60;
+
+function fmtRate(b) {
+  if (b == null) return '—';
+  const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
+  let i = 0;
+  while (b >= 1024 && i < units.length - 1) { b /= 1024; i++; }
+  return (i === 0 || b >= 100 ? b.toFixed(0) : b.toFixed(1)) + ' ' + units[i];
+}
+
+const netData = makeChartData('#9b7fd6');
+netData.datasets.push({ ...makeChartData('#e0913a').datasets[0] });
+netData.datasets.forEach(ds => ds.fill = false);
+const netChart = new Chart(document.getElementById('chart-net'), {
+  type: 'line',
+  data: netData,
+  options: chartOpts(null, fmtRate),
+});
+
+// Push one value per dataset (a single value for single-line charts).
+function pushChart(chart, ...values) {
+  chart.data.datasets.forEach((ds, i) => {
+    ds.data.push(values[i]);
+    if (ds.data.length > MAX_POINTS) ds.data.shift();
+  });
   chart.update('none');
 }
 
@@ -809,11 +900,131 @@ async function fetchMetrics() {
 
     pushChart(cpuChart, d.cpu ?? 0);
     pushChart(ramChart, ramPct);
+
+    document.getElementById('fps-val').textContent = d.fps != null ? Math.round(d.fps) : '—';
+    document.getElementById('fps-sub').textContent = d.fps != null ? 'from the stats file'
+      : (d.running ? 'no fresh stats file data' : 'server offline');
+    pushChart(fpsChart, d.fps ?? null);
+
+    document.getElementById('net-down-val').textContent = '↓ ' + fmtRate(d.net_down);
+    document.getElementById('net-up-val').textContent   = '↑ ' + fmtRate(d.net_up);
+    pushChart(netChart, d.net_down ?? null, d.net_up ?? null);
   } catch(e) {}
 }
 
 setInterval(fetchMetrics, 3000);
 fetchMetrics();
+
+// ─── Current status (Server Admin Tools stats file) ──────────────────────────
+const STAT_LABELS = { uptime_seconds: 'Uptime', updated: 'Updated', fps: 'FPS', ai_characters: 'AI characters' };
+const STATS_STALE_AFTER = 30;  // seconds; matches the server side
+
+function prettyKey(k) {
+  if (STAT_LABELS[k]) return STAT_LABELS[k];
+  k = k.replace(/^serveradmintools_/, '').replace(/_/g, ' ');
+  return k.charAt(0).toUpperCase() + k.slice(1);
+}
+
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.round(sec));
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  if (d) return `${d}d ${h}h ${m}m`;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+function fmtStatValue(k, v, now) {
+  if (k === 'uptime_seconds' && typeof v === 'number') return fmtDuration(v);
+  if (k === 'updated' && typeof v === 'number')
+    return new Date(v * 1000).toLocaleTimeString('en-GB') + ` (${fmtDuration(now - v)} ago)`;
+  if (Array.isArray(v)) return v.length ? v.join(', ') : 'none';
+  return String(v);
+}
+
+async function fetchServerStats() {
+  try {
+    const r = await fetch('/api/server-stats');
+    if (r.status === 401) { window.location.href = '/login'; return; }
+    const d = await r.json();
+    const meta = document.getElementById('stats-meta');
+    const body = document.getElementById('stats-body');
+    if (!d.ok) {
+      meta.className = 'stats-meta stale';
+      meta.textContent = d.error === 'not found'
+        ? `No stats file found at ${d.path}. It is written by the Server Admin Tools mod while the server runs; set STATS_FILE in config.env if yours is elsewhere.`
+        : `Could not read ${d.path}: ${d.error}`;
+      if (d.error === 'not found') body.innerHTML = '';
+      return;
+    }
+    const s = d.stats || {};
+    const age = typeof s.updated === 'number' ? d.now - s.updated : null;
+    const stale = !d.running || (age != null && age > STATS_STALE_AFTER);
+    meta.className = 'stats-meta' + (stale ? ' stale' : '');
+    meta.textContent = (stale ? (d.running ? '⚠ Not updating — ' : '⚠ Server offline — ') : '')
+      + (age != null ? `updated ${fmtDuration(age)} ago` : 'no update time in file') + ` · ${d.path}`;
+
+    const tiles = [], groups = [];
+    for (const [k, v] of Object.entries(s)) {
+      if (v && typeof v === 'object' && !Array.isArray(v)) {
+        const entries = Object.entries(v);
+        const rows = entries.length ? entries.map(([sk, sv]) => (typeof sv === 'object' && sv !== null)
+            ? `<div class="stat-row"><span>${escHtml(prettyKey(sk))}</span><span class="sub">${escHtml(JSON.stringify(sv))}</span></div>`
+            : typeof sv === 'string'
+              // e.g. connected_players: id → name; the name is what matters
+              ? `<div class="stat-row"><span>${escHtml(sv)}</span><span class="sub">${escHtml(sk)}</span></div>`
+              : `<div class="stat-row"><span>${escHtml(prettyKey(sk))}</span><span>${escHtml(String(sv))}</span></div>`).join('')
+          : '<div class="empty-note">none</div>';
+        groups.push(`<div class="stat-group"><div class="title">${escHtml(prettyKey(k))}</div>${rows}</div>`);
+      } else {
+        tiles.push(`<div class="stat-tile"><div class="k">${escHtml(prettyKey(k))}</div><div class="v">${escHtml(fmtStatValue(k, v, d.now))}</div></div>`);
+      }
+    }
+    body.innerHTML = `<div class="stat-tiles">${tiles.join('')}</div>${groups.join('')}`;
+  } catch(e) {}
+}
+
+// ─── Server timeline (joins, leaves, starts, stops) ──────────────────────────
+const TIMELINE_TAGS = {
+  player_joined:  ['join',  'JOIN'],
+  player_left:    ['leave', 'LEAVE'],
+  server_started: ['start', 'START'],
+  server_stopped: ['stop',  'STOP'],
+};
+
+function timelineText(e) {
+  if (e.type === 'player_joined') return `${escHtml(e.name)} joined`;
+  if (e.type === 'player_left')   return `${escHtml(e.name)} left`;
+  const what = e.type === 'server_started' ? 'Server started' : 'Server stopped';
+  return `${what} <span class="detail">— ${escHtml(e.detail || '')}</span>`;
+}
+
+let lastTimelineJson = null;
+async function fetchTimeline() {
+  try {
+    const r = await fetch('/api/events?limit=300');
+    if (r.status === 401) { window.location.href = '/login'; return; }
+    const d = await r.json();
+    const json = JSON.stringify(d.events);
+    if (json === lastTimelineJson) return;  // unchanged: keep the scroll position
+    lastTimelineJson = json;
+    const el = document.getElementById('timeline');
+    if (!d.events.length) {
+      el.innerHTML = '<div class="empty-note">Nothing yet. Joins, leaves, starts and stops appear here as they happen.</div>';
+      return;
+    }
+    el.innerHTML = d.events.map(e => {
+      const [cls, label] = TIMELINE_TAGS[e.type] || ['leave', e.type];
+      const when = new Date(e.ts * 1000).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      return `<div class="tl-row"><span class="tl-time">${when}</span><span class="tl-tag ${cls}">${label}</span><span class="tl-text">${timelineText(e)}</span></div>`;
+    }).join('');
+  } catch(e) {}
+}
+
+fetchServerStats();
+fetchTimeline();
+setInterval(fetchServerStats, 5000);
+setInterval(fetchTimeline, 5000);
 
 // ─── SSE Log stream ───────────────────────────────────────────────────────────
 let evtSource = null;

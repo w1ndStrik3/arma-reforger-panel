@@ -717,8 +717,13 @@ def tail_lines(path, n):
             data = f.read(step) + data
     return data.decode("utf-8", errors="replace").splitlines()[-n:]
 
+# When the panel last launched the server and why, so the monitor can tell
+# panel starts from ones that happened outside it.
+_last_launch = {"ts": 0.0, "action": None}
+
 def launch_server(load_save=True):
     apply_selected_modlist()
+    _last_launch.update(ts=time.time(), action=_LIFECYCLE["action"] or "start")
     args = [SERVER_BINARY] + build_server_args(load_save)
     if IS_WINDOWS:
         # Give the server its own console, as if started by hand, so the panel
@@ -1075,6 +1080,8 @@ def api_metrics():
         "cpu": cpu, "ram_process": ram,
         "ram_used": ram_used, "ram_total": ram_total,
         "running": proc is not None, "ts": int(time.time()),
+        "fps": current_fps(),
+        "net_up": _mon_runtime["net_up"], "net_down": _mon_runtime["net_down"],
     })
 
 @app.route("/api/logs")
@@ -1496,5 +1503,288 @@ def api_hard_reset():
 def api_soft_restart():
     return _begin_lifecycle("soft-restart", require_running=True)
 
+# ─── MONITORING ──────────────────────────────────────────────────────────────
+#
+# A background thread runs every couple of seconds and
+#   - follows the newest console.log for players joining and leaving,
+#   - notices the server process starting and stopping,
+#   - measures network throughput (whole machine, loopback excluded).
+# Timeline entries are appended to events.jsonl. Where it is in the log is kept
+# in .monitor-state.json so a panel restart picks up where it left off, and
+# lines written while the panel was down are still turned into entries.
+# Current server stats come from the Server Admin Tools mod's stats file.
+
+EVENTS_FILE         = os.path.join(_BASE_DIR, "events.jsonl")
+_MONITOR_STATE_FILE = os.path.join(_BASE_DIR, ".monitor-state.json")
+_MONITOR_INTERVAL   = 2.0
+_STATS_FILE_NAME    = "serveradmintools_stats.json"
+# Stats older than this (seconds) are treated as stale: the server or mod
+# isn't updating them.
+_STATS_MAX_AGE      = 30
+
+_LOG_TIME_RE = re.compile(r"^(\d{2}):(\d{2}):(\d{2})\.(\d{3})")
+_LOG_DIR_RE  = re.compile(r"logs_(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})")
+# "### Updating player" is logged once the player is fully in the game. Names
+# can contain commas, so the name runs up to the last ", rplIdentity=".
+_JOIN_RE  = re.compile(r"### Updating player: PlayerId=(\d+), Name=(.*), rplIdentity=(0x[0-9A-Fa-f]+), IdentityId=(\S+)")
+_LEAVE_RE = re.compile(r"ServerImpl event: disconnected \(identity=(0x[0-9A-Fa-f]+)")
+
+_EVENTS_LOCK = threading.Lock()
+_monitor_started = False
+_monitor_start_lock = threading.Lock()
+# Log follower state (persisted). midnight: epoch of 00:00 on the day the log
+# began; days: midnights passed since; last_sod: last line's second-of-day.
+_mon = {"path": None, "offset": 0, "midnight": 0.0, "days": 0, "last_sod": 0.0, "joined": {}}
+_mon_runtime = {"pid": None, "net": None, "net_at": 0.0, "net_up": None, "net_down": None}
+
+_ACTION_LABELS = {"start": "Start", "stop": "Stop", "soft-restart": "Soft restart", "hard-reset": "Hard reset"}
+
+def record_event(kind, ts=None, **fields):
+    entry = {"ts": round(ts if ts is not None else time.time(), 3), "type": kind, **fields}
+    with _EVENTS_LOCK, open(EVENTS_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+def read_events(limit):
+    if not os.path.exists(EVENTS_FILE):
+        return []
+    events = []
+    for line in tail_lines(EVENTS_FILE, limit):
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            continue
+    events.sort(key=lambda e: e.get("ts", 0), reverse=True)
+    return events
+
+def _stats_path():
+    configured = _cfg.get("STATS_FILE", "").strip()
+    if configured:
+        return configured
+    # Match the name case-insensitively: the mod may capitalise it, and Linux
+    # file names are case-sensitive.
+    try:
+        for fn in os.listdir(PROFILE_DIR):
+            if fn.lower() == _STATS_FILE_NAME:
+                return os.path.join(PROFILE_DIR, fn)
+    except OSError:
+        pass
+    return os.path.join(PROFILE_DIR, _STATS_FILE_NAME)
+
+def read_server_stats():
+    """Returns (stats dict or None, path, error or None)."""
+    path = _stats_path()
+    for attempt in range(2):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f), path, None
+        except FileNotFoundError:
+            return None, path, "not found"
+        except (OSError, ValueError) as e:
+            # The mod rewrites the file constantly; a read can catch it half-written.
+            if attempt:
+                return None, path, str(e)
+            time.sleep(0.1)
+
+def current_fps():
+    stats, _path, _err = read_server_stats()
+    if not stats or get_server_pid() is None:
+        return None
+    updated = stats.get("updated")
+    if isinstance(updated, (int, float)) and time.time() - updated > _STATS_MAX_AGE:
+        return None
+    fps = stats.get("fps")
+    return fps if isinstance(fps, (int, float)) else None
+
+def _log_day_start(path):
+    """(epoch of midnight on the day the log began, second-of-day it began),
+    from the logs_YYYY-MM-DD_HH-MM-SS folder name, else the file's mtime."""
+    m = _LOG_DIR_RE.search(os.path.basename(os.path.dirname(path)))
+    if m:
+        y, mo, d, h, mi, s = map(int, m.groups())
+    else:
+        t = time.localtime(os.path.getmtime(path))
+        y, mo, d, h, mi, s = t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0
+    return time.mktime((y, mo, d, 0, 0, 0, 0, 0, -1)), h * 3600 + mi * 60 + s
+
+def _switch_log(path):
+    midnight, start_sod = _log_day_start(path)
+    _mon.update(path=path, offset=0, midnight=midnight, days=0, last_sod=float(start_sod), joined={})
+
+def _handle_log_line(line, record):
+    m = _LOG_TIME_RE.match(line)
+    if not m:
+        return
+    h, mi, s, ms = map(int, m.groups())
+    sod = h * 3600 + mi * 60 + s + ms / 1000
+    if sod < _mon["last_sod"] - 3600:  # clock went back a lot: past midnight
+        _mon["days"] += 1
+    _mon["last_sod"] = sod
+    ts = _mon["midnight"] + _mon["days"] * 86400 + sod
+    j = _JOIN_RE.search(line)
+    if j:
+        name, ident = j.group(2).strip(), j.group(3)
+        if ident not in _mon["joined"] and record:
+            record_event("player_joined", ts, name=name, identity=j.group(4))
+        _mon["joined"][ident] = name
+        return
+    l = _LEAVE_RE.search(line)
+    if l:
+        # Players who drop while still loading never "joined"; skip those.
+        name = _mon["joined"].pop(l.group(1), None)
+        if name is not None and record:
+            record_event("player_left", ts, name=name)
+
+def _read_log(record):
+    """Process complete lines after the saved offset in the current log."""
+    path = _mon["path"]
+    try:
+        if os.path.getsize(path) < _mon["offset"]:
+            _switch_log(path)  # file was replaced or truncated
+        with open(path, "rb") as f:
+            f.seek(_mon["offset"])
+            while True:
+                chunk = f.read(4 * 1024 * 1024)
+                end = chunk.rfind(b"\n")
+                if end < 0:
+                    break
+                for line in chunk[:end].decode("utf-8", errors="replace").splitlines():
+                    _handle_log_line(line, record)
+                _mon["offset"] += end + 1
+                f.seek(_mon["offset"])
+    except OSError:
+        pass
+
+def _follow_logs():
+    if _mon["path"] and os.path.exists(_mon["path"]):
+        _read_log(record=True)
+    latest = get_latest_log()
+    if latest and latest != _mon["path"]:
+        _switch_log(latest)
+        _read_log(record=True)
+
+def _recent_panel_action():
+    if _LIFECYCLE["action"]:
+        return _LIFECYCLE["action"]
+    # A restart can finish between two monitor ticks; allow a few seconds.
+    last = _LIFECYCLE["last"]
+    if last and time.time() - last["ts"] < 3 * _MONITOR_INTERVAL:
+        return last["action"]
+    return None
+
+def _check_process():
+    proc = get_server_process()
+    pid = proc.pid if proc else None
+    prev = _mon_runtime["pid"]
+    _mon_runtime["pid"] = pid
+    if pid == prev:
+        return
+    started = None
+    if pid is not None:
+        try:
+            started = proc.create_time()
+        except psutil.Error:
+            started = time.time()
+    if prev is not None:
+        action = _recent_panel_action()
+        # If it was already restarted by this tick, the stop came first.
+        stopped = min(time.time(), started - 0.001) if started else None
+        record_event("server_stopped", stopped,
+                     detail=f"From the panel ({_ACTION_LABELS.get(action, action)})" if action
+                     else "Outside the panel (crashed, or closed on the server)")
+    if pid is not None:
+        from_panel = abs(started - _last_launch["ts"]) < 20
+        action = _last_launch["action"]
+        record_event("server_started", started,
+                     detail=f"From the panel ({_ACTION_LABELS.get(action, action)})" if from_panel
+                     else "Outside the panel")
+
+def _net_totals():
+    sent = recv = 0
+    for name, c in psutil.net_io_counters(pernic=True).items():
+        if name == "lo" or "loopback" in name.lower():
+            continue
+        sent += c.bytes_sent
+        recv += c.bytes_recv
+    return sent, recv
+
+def _sample_network():
+    now = time.time()
+    totals = _net_totals()
+    prev, prev_at = _mon_runtime["net"], _mon_runtime["net_at"]
+    _mon_runtime.update(net=totals, net_at=now)
+    if prev is None or now <= prev_at:
+        return
+    up, down = totals[0] - prev[0], totals[1] - prev[1]
+    if up < 0 or down < 0:  # counters reset (adapter re-enabled)
+        return
+    _mon_runtime.update(net_up=up / (now - prev_at), net_down=down / (now - prev_at))
+
+def _load_monitor_state():
+    try:
+        with open(_MONITOR_STATE_FILE, encoding="utf-8") as f:
+            saved = json.load(f)
+        if saved.get("path") and os.path.exists(saved["path"]):
+            _mon.update({k: saved[k] for k in _mon if k in saved})
+    except (OSError, ValueError):
+        pass
+
+def _save_monitor_state(last_saved):
+    data = json.dumps(_mon, ensure_ascii=False)
+    if data != last_saved:
+        with open(_MONITOR_STATE_FILE, "w", encoding="utf-8") as f:
+            f.write(data)
+    return data
+
+def _monitor_loop():
+    _load_monitor_state()
+    if _mon["path"] is None:
+        # First run: read the current log silently, only to learn who is
+        # connected, so joins from before the panel was installed aren't
+        # reported as new.
+        initial = get_latest_log()
+        if initial:
+            _switch_log(initial)
+            _read_log(record=False)
+    # Whatever is running when the panel starts isn't a new start.
+    _mon_runtime["pid"] = get_server_pid()
+    last_saved = None
+    while True:
+        try:
+            _sample_network()
+            _follow_logs()
+            _check_process()
+            last_saved = _save_monitor_state(last_saved)
+        except Exception as e:
+            print(f"[panel] monitor error: {e}", flush=True)
+        time.sleep(_MONITOR_INTERVAL)
+
+def start_monitor():
+    global _monitor_started
+    with _monitor_start_lock:
+        if _monitor_started:
+            return
+        _monitor_started = True
+    threading.Thread(target=_monitor_loop, daemon=True, name="monitor").start()
+
+@app.before_request
+def _ensure_monitor():
+    start_monitor()
+
+@app.route("/api/events")
+def api_events():
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    limit = max(1, min(int(request.args.get("limit", 200)), 2000))
+    return jsonify({"ok": True, "events": read_events(limit)})
+
+@app.route("/api/server-stats")
+def api_server_stats():
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    stats, path, error = read_server_stats()
+    return jsonify({"ok": stats is not None, "stats": stats, "path": path, "error": error,
+                    "now": time.time(), "running": get_server_pid() is not None})
+
 if __name__ == "__main__":
+    start_monitor()
     app.run(host=PANEL_HOST, port=PANEL_PORT, threaded=True)

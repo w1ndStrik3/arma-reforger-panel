@@ -8,3 +8,5 @@ config.env
 .scenario-cache.json
 modlists/
 .panel-state.json
+events.jsonl
+.monitor-state.json

@@ -12,7 +12,9 @@ A lightweight, self-hosted web panel for managing your **Arma Reforger dedicated
 - **Server control** — Start, stop and hard reset your server from the browser
 - **Soft restart** — Save the game state, stop the server and bring it back up from that save
 - **Linux and Windows** — Runs on Ubuntu (with the installer) or on Windows Server (manual setup)
-- **Real-time monitoring** — Live CPU and RAM charts updated every 3 seconds
+- **Real-time monitoring** — Live CPU, RAM, server FPS and network (upload/download) charts updated every 3 seconds
+- **Server timeline** — Players joining and leaving (with names) plus server starts and stops, timestamped; recorded in the background to `events.jsonl` even when nobody has the panel open
+- **Current status** — Everything in the Server Admin Tools mod's `serveradmintools_stats.json` (players, FPS, uptime, AI, vehicles, events…), refreshed live
 - **Live log streaming** — Server console logs with colour-coded output (errors, warnings, network events)
 - **Mission selector** — Vanilla scenarios plus any found in installed mods; the selected scenario's resource name (e.g. `{0648CDB32D6B02B3}Missions/SP02_AirSupport.conf`) is shown under the dropdown
 - **Mod lists** — Keep several named mod lists, edit each as JSON, and pick one from a dropdown; the selected list is written into `config.json` every time the server starts
@@ -147,6 +149,9 @@ MAX_FPS=60
 
 # Seconds to wait for the server to save and exit on Stop / Soft restart
 SHUTDOWN_TIMEOUT=180
+
+# Server Admin Tools stats file (defaults to <PROFILE_DIR>/serveradmintools_stats.json)
+# STATS_FILE=
 ```
 
 After editing, restart the panel:
