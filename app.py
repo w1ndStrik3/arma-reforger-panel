@@ -23,6 +23,7 @@ import json
 import threading
 import time
 import glob
+import calendar
 
 IS_WINDOWS = os.name == "nt"
 
@@ -1595,16 +1596,39 @@ def current_fps():
     fps = stats.get("fps")
     return fps if isinstance(fps, (int, float)) else None
 
+def _creation_time(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    birth = getattr(st, "st_birthtime", None)
+    if birth is None and IS_WINDOWS:
+        birth = st.st_ctime  # creation time on Windows
+    return birth
+
 def _log_day_start(path):
-    """(epoch of midnight on the day the log began, second-of-day it began),
-    from the logs_YYYY-MM-DD_HH-MM-SS folder name, else the file's mtime."""
-    m = _LOG_DIR_RE.search(os.path.basename(os.path.dirname(path)))
-    if m:
-        y, mo, d, h, mi, s = map(int, m.groups())
-    else:
+    """(epoch of midnight on the day the log began, second-of-day it began).
+
+    Log lines carry only the server's local clock time. The folder name
+    (logs_YYYY-MM-DD_HH-MM-SS) is the server's local start time, and the
+    folder's creation time is the same moment as an absolute time, so the two
+    give the server's UTC offset. That keeps join/leave times right even when
+    the panel's own idea of the time zone is out of date (a running process
+    doesn't pick up a change to the machine's time zone). Without a creation
+    time (most Linux filesystems) the panel's local time zone is used."""
+    folder = os.path.dirname(path)
+    m = _LOG_DIR_RE.search(os.path.basename(folder))
+    if not m:
         t = time.localtime(os.path.getmtime(path))
-        y, mo, d, h, mi, s = t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0
-    return time.mktime((y, mo, d, 0, 0, 0, 0, 0, -1)), h * 3600 + mi * 60 + s
+        return time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, -1)), 0
+    y, mo, d, h, mi, s = map(int, m.groups())
+    start_sod = h * 3600 + mi * 60 + s
+    created = _creation_time(folder)
+    if created is not None:
+        offset = round((created - calendar.timegm((y, mo, d, h, mi, s, 0, 0, 0))) / 900) * 900
+        if abs(offset) <= 14 * 3600:  # anything else means the folder was copied/touched
+            return calendar.timegm((y, mo, d, 0, 0, 0, 0, 0, 0)) + offset, start_sod
+    return time.mktime((y, mo, d, 0, 0, 0, 0, 0, -1)), start_sod
 
 def _switch_log(path):
     midnight, start_sod = _log_day_start(path)
@@ -1725,6 +1749,9 @@ def _load_monitor_state():
             saved = json.load(f)
         if saved.get("path") and os.path.exists(saved["path"]):
             _mon.update({k: saved[k] for k in _mon if k in saved})
+            # Recompute rather than trust the saved value, which may have been
+            # worked out with an outdated time zone.
+            _mon["midnight"] = _log_day_start(_mon["path"])[0]
     except (OSError, ValueError):
         pass
 
