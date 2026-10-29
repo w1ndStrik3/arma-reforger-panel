@@ -88,6 +88,8 @@ PROFILE_DIR    = _cfg.get(
 )
 SERVER_BINARY  = os.path.join(SERVER_DIR, "ArmaReforgerServer.exe" if IS_WINDOWS else "ArmaReforgerServer")
 MAX_FPS        = _cfg.get("MAX_FPS", "").strip()
+# How often (ms) the server logs its stats line, which carries the FPS.
+LOG_STATS_INTERVAL_MS = 1000
 # Seconds to wait for the server to save and exit on stop / soft restart.
 SHUTDOWN_TIMEOUT = int(_cfg.get("SHUTDOWN_TIMEOUT", 180))
 # Small helper that delivers Ctrl+C to the server's console on Windows.
@@ -98,12 +100,14 @@ def build_server_args(load_save=True):
     except a hard restart: with no save files it's a no-op, and including it
     keeps panel-launched and systemd-launched starts behaving the same way.
     The 'enabled' toggle in the UI controls only the `persistence` block in
-    config.json (autosave)."""
+    config.json (autosave). `-logStats` makes the server log its FPS every
+    second; the panel's FPS graph reads it from console.log."""
     args = ["-config", SERVER_CONFIG]
     if load_save:
         args.append("-loadSessionSave")
     if MAX_FPS:
         args.append(f"-maxFPS={MAX_FPS}")
+    args += ["-logStats", str(LOG_STATS_INTERVAL_MS)]
     return args
 
 # Persistent secret key so sessions survive panel restarts.
@@ -1533,9 +1537,6 @@ EVENTS_FILE         = os.path.join(_BASE_DIR, "events.jsonl")
 _MONITOR_STATE_FILE = os.path.join(_BASE_DIR, ".monitor-state.json")
 _MONITOR_INTERVAL   = 2.0
 _STATS_FILE_NAME    = "serveradmintools_stats.json"
-# Stats older than this (seconds) are treated as stale: the server or mod
-# isn't updating them.
-_STATS_MAX_AGE      = 30
 
 _LOG_TIME_RE = re.compile(r"^(\d{2}):(\d{2}):(\d{2})\.(\d{3})")
 _LOG_DIR_RE  = re.compile(r"logs_(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})")
@@ -1543,6 +1544,10 @@ _LOG_DIR_RE  = re.compile(r"logs_(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})
 # can contain commas, so the name runs up to the last ", rplIdentity=".
 _JOIN_RE  = re.compile(r"### Updating player: PlayerId=(\d+), Name=(.*), rplIdentity=(0x[0-9A-Fa-f]+), IdentityId=(\S+)")
 _LEAVE_RE = re.compile(r"ServerImpl event: disconnected \(identity=(0x[0-9A-Fa-f]+)")
+# The -logStats line, e.g. "FPS: 59.9, frame time (avg: ...". \b keeps "maxFPS" out.
+_FPS_RE   = re.compile(r"\bFPS:\s*(\d+(?:\.\d+)?)")
+# A logged FPS older than this (seconds since the panel read it) is not shown.
+_FPS_MAX_AGE = 10
 
 _EVENTS_LOCK = threading.Lock()
 _monitor_started = False
@@ -1550,7 +1555,8 @@ _monitor_start_lock = threading.Lock()
 # Log follower state (persisted). midnight: epoch of 00:00 on the day the log
 # began; days: midnights passed since; last_sod: last line's second-of-day.
 _mon = {"path": None, "offset": 0, "midnight": 0.0, "days": 0, "last_sod": 0.0, "joined": {}}
-_mon_runtime = {"pid": None, "net": None, "net_at": 0.0, "net_up": None, "net_down": None}
+_mon_runtime = {"pid": None, "net": None, "net_at": 0.0, "net_up": None, "net_down": None,
+                "fps": None, "fps_at": None}
 
 _ACTION_LABELS = {"start": "Start", "stop": "Stop", "soft-restart": "Soft restart", "hard-restart": "Hard restart",
                   "hard-reset": "Hard reset"}  # older timeline entries
@@ -1602,14 +1608,12 @@ def read_server_stats():
             time.sleep(0.1)
 
 def current_fps():
-    stats, _path, _err = read_server_stats()
-    if not stats or get_server_pid() is None:
+    """The server's own FPS from its latest -logStats line, if that is recent."""
+    if _mon_runtime["fps_at"] is None or get_server_pid() is None:
         return None
-    updated = stats.get("updated")
-    if isinstance(updated, (int, float)) and time.time() - updated > _STATS_MAX_AGE:
+    if time.time() - _mon_runtime["fps_at"] > _FPS_MAX_AGE:
         return None
-    fps = stats.get("fps")
-    return fps if isinstance(fps, (int, float)) else None
+    return _mon_runtime["fps"]
 
 def _creation_time(path):
     try:
@@ -1659,6 +1663,11 @@ def _handle_log_line(line, record):
         _mon["days"] += 1
     _mon["last_sod"] = sod
     ts = _mon["midnight"] + _mon["days"] * 86400 + sod
+    f = _FPS_RE.search(line)
+    if f:
+        if record:  # not while silently reading an old log on first run
+            _mon_runtime.update(fps=float(f.group(1)), fps_at=time.time())
+        return
     j = _JOIN_RE.search(line)
     if j:
         name, ident = j.group(2).strip(), j.group(3)

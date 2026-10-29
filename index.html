@@ -587,7 +587,7 @@
       <div class="chart-header">
         <div>
           <div class="chart-title">FPS — Server</div>
-          <div class="chart-sub" id="fps-sub" style="text-align:left">from the stats file</div>
+          <div class="chart-sub" id="fps-sub" style="text-align:left">reported by the server</div>
         </div>
         <div class="chart-value fps" id="fps-val">—</div>
       </div>
@@ -902,8 +902,8 @@ async function fetchMetrics() {
     pushChart(ramChart, ramPct);
 
     document.getElementById('fps-val').textContent = d.fps != null ? Math.round(d.fps) : '—';
-    document.getElementById('fps-sub').textContent = d.fps != null ? 'from the stats file'
-      : (d.running ? 'no fresh stats file data' : 'server offline');
+    document.getElementById('fps-sub').textContent = d.fps != null ? 'reported by the server'
+      : (d.running ? 'no FPS in the server log yet (needs -logStats)' : 'server offline');
     pushChart(fpsChart, d.fps ?? null);
 
     document.getElementById('net-down-val').textContent = '↓ ' + fmtRate(d.net_down);
@@ -917,7 +917,7 @@ fetchMetrics();
 
 // ─── Current status (Server Admin Tools stats file) ──────────────────────────
 const STAT_LABELS = { uptime_seconds: 'Uptime', updated: 'Updated', fps: 'FPS', ai_characters: 'AI characters' };
-const STATS_STALE_AFTER = 30;  // seconds; matches the server side
+const STATS_STALE_AFTER = 30;  // seconds without an update before the stats count as stale
 
 function prettyKey(k) {
   if (STAT_LABELS[k]) return STAT_LABELS[k];
