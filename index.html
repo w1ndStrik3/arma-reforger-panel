@@ -547,9 +547,9 @@
     <button class="ctrl-btn stop" id="btn-stop" onclick="serverAction('stop')" disabled>
       <span class="ctrl-icon">■</span>STOP
     </button>
-    <button class="ctrl-btn reset" id="btn-reset" onclick="serverAction('hard-reset')" disabled
-            title="Kill the server without saving, move the session save to an archive folder, and start a fresh world">
-      <span class="ctrl-icon">↺</span>HARD RESET
+    <button class="ctrl-btn reset" id="btn-reset" onclick="serverAction('hard-restart')" disabled
+            title="Kill the server without saving, move this scenario's session save to an archive folder, and start a fresh world">
+      <span class="ctrl-icon">↺</span>HARD RESTART
     </button>
     <button class="ctrl-btn soft" id="btn-soft" onclick="serverAction('soft-restart')" disabled
             title="Save the game state, stop the server and start it again from that save">
@@ -722,7 +722,7 @@
     <div class="card-label">Persistence</div>
     <div style="font-size:11.5px;color:var(--muted);line-height:1.6;margin-bottom:14px;">
       Start and Soft restart pass <code>-loadSessionSave</code>, so any existing save is loaded on
-      start; Hard reset moves the session save to an archive folder and starts fresh. This toggle writes the <code>game.gameProperties.persistence</code> block in
+      start; Hard restart moves the current scenario's session save to an archive folder and starts it fresh. This toggle writes the <code>game.gameProperties.persistence</code> block in
       <code>config.json</code> — enable to autosave every N minutes, disable to stop writing new
       saves (existing saves still load on start; use <strong>Flush saves</strong> to start fresh).
       Session save only works in scenarios that implement it (Conflict, Combat Ops); Game Master
@@ -1355,7 +1355,7 @@ function setBusy(state) {
 const LIFECYCLE_PHASES = {
   saving:   'Saving game state, waiting for the server to exit...',
   stopping: 'Stopping server...',
-  archiving: 'Moving the session save to the archive folder...',
+  archiving: "Moving this scenario's session save to the archive folder...",
   starting: 'Starting server...',
 };
 
@@ -1376,12 +1376,12 @@ async function waitForLifecycle() {
 
 async function serverAction(action) {
   const labels = { start: 'Starting server...', stop: 'Stopping server...',
-                   'hard-reset': 'Hard reset: stopping server...',
+                   'hard-restart': 'Hard restart: stopping server...',
                    'soft-restart': 'Saving game state and restarting...' };
   const success = { start: 'Server started', stop: 'Server stopped',
-                    'hard-reset': 'Server reset to a fresh world',
+                    'hard-restart': 'Server restarted on a fresh world',
                     'soft-restart': 'Server restarted from the saved game state' };
-  if (action === 'hard-reset' && !confirm('Hard reset kills the server WITHOUT saving, moves the current session save to an archive folder (save-archive in the profile folder), and starts a fresh world. Player saves are kept. Continue?')) return;
+  if (action === 'hard-restart' && !confirm("Hard restart kills the server WITHOUT saving, moves the current scenario's session save to an archive folder (save-archive in the profile folder), and starts it on a fresh world. Other scenarios' saves and player saves are kept. Continue?")) return;
   setBusy(true);
   setLog(labels[action], 'info');
   try {
@@ -1395,10 +1395,10 @@ async function serverAction(action) {
       if (last === null) return;
       if (last && !last.ok) {
         setLog('Error: ' + (last.error || 'unknown'), 'error');
-      } else if (action === 'hard-reset') {
+      } else if (action === 'hard-restart') {
         const a = last.archived || {};
-        if (a.count) setLog(`${success[action]}; ${a.count} save file${a.count === 1 ? '' : 's'} moved to ${a.path}`, 'ok');
-        else setLog(`Server restarted, but no session save was found in ${a.save_root || 'the save folder'}; if the old world still loads, set PROFILE_DIR in config.env`, 'error');
+        if (a.count) setLog(`${success[action]}; moved ${(a.folders || []).join(', ')} (${a.count} file${a.count === 1 ? '' : 's'}) to ${a.path}`, 'ok');
+        else setLog(`Server restarted, but no session save for ${a.scenario || 'this scenario'} was found in ${a.save_root || 'the save folder'}\\game; if the old world still loads, check PROFILE_DIR in config.env`, 'error');
       } else if (action === 'soft-restart' && !d.persistence) {
         setLog('Server restarted, but persistence is off in config.json, so there may be no save to load', 'error');
       } else {

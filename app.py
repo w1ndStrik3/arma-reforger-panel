@@ -95,7 +95,7 @@ _CTRL_C_HELPER = os.path.join(_BASE_DIR, "win_ctrl_c.py")
 
 def build_server_args(load_save=True):
     """Build the launch arguments. `-loadSessionSave` is passed on every launch
-    except a hard reset: with no save files it's a no-op, and including it
+    except a hard restart: with no save files it's a no-op, and including it
     keeps panel-launched and systemd-launched starts behaving the same way.
     The 'enabled' toggle in the UI controls only the `persistence` block in
     config.json (autosave)."""
@@ -880,33 +880,43 @@ def _flush_saves():
                 pass
     return removed
 
-def _archive_session_save():
-    """Move the world session save (the contents of `.save/game/`) into
-    `PROFILE_DIR/save-archive/<timestamp>/game/` so the next launch finds no
-    session and starts a fresh world. Player saves and settings stay where
-    they are, and nothing is deleted; moving the folder back restores that
-    world. Returns (files moved, archive path or None if nothing to move).
-    Raises if a file can't be moved, so a half-moved save is never launched."""
+def _scenario_save_folders(scenario_id):
+    """The folders in `.save/game/` that hold sessions of `scenario_id`. The
+    server names them after the scenario's GUID and file name, e.g.
+    {424AE7D5DFD33E8B}Missions/PvE_Kolgujev_Fixed_WCS_loadout.conf ->
+    424AE7D5DFD33E8B-PvE-Kolgujev-Fixed-WCS-loadout; matching on the GUID
+    prefix avoids depending on exactly how the name part is rewritten."""
+    m = re.match(r"\{([0-9A-Fa-f]{16})\}", scenario_id or "")
+    game_dir = os.path.join(_save_root(), "game")
+    if not m or not os.path.isdir(game_dir):
+        return []
+    guid = m.group(1).upper()
+    return sorted(name for name in os.listdir(game_dir)
+                  if os.path.isdir(os.path.join(game_dir, name))
+                  and (name.upper() == guid or name.upper().startswith(guid + "-")))
+
+def _archive_scenario_save(scenario_id):
+    """Move the session save of `scenario_id` (its folder(s) in `.save/game/`)
+    into `PROFILE_DIR/save-archive/<timestamp>/game/`, so the next launch
+    finds no session for it and starts a fresh world. Other scenarios' saves,
+    player saves and settings stay where they are, and nothing is deleted;
+    moving the folder back restores that world. Returns (files moved, archive
+    path or None if there was nothing to move, folder names moved). Raises if
+    a file can't be moved, so a half-moved save is never launched."""
     import shutil
-    root = _save_root()
-    entries = [(sub, name) for sub in ("game",)
-               if os.path.isdir(os.path.join(root, sub))
-               for name in os.listdir(os.path.join(root, sub))]
-    if not entries:
-        return 0, None
+    folders = _scenario_save_folders(scenario_id)
+    if not folders:
+        return 0, None, []
     archive = os.path.join(PROFILE_DIR, "save-archive", time.strftime("%Y-%m-%d_%H-%M-%S"))
     while os.path.exists(archive):
         archive += "_"
+    os.makedirs(os.path.join(archive, "game"))
     moved = 0
-    for sub, name in entries:
-        src = os.path.join(root, sub, name)
-        if os.path.isdir(src):
-            moved += sum(len(files) for _dp, _dn, files in os.walk(src))
-        else:
-            moved += 1
-        os.makedirs(os.path.join(archive, sub), exist_ok=True)
-        shutil.move(src, os.path.join(archive, sub, name))
-    return moved, archive
+    for name in folders:
+        src = os.path.join(_save_root(), "game", name)
+        moved += sum(len(files) for _dp, _dn, files in os.walk(src))
+        shutil.move(src, os.path.join(archive, "game", name))
+    return moved, archive, folders
 
 
 def get_map_name(cfg=None):
@@ -1425,10 +1435,11 @@ def api_start():
 # These can take minutes (the server writes its save before exiting), so they
 # run in a background thread; /api/status reports progress under "lifecycle".
 #   stop          ask the server to save and exit
-#   hard-reset    kill the server without saving, move the session save into an
-#                 archive folder and start it again on a fresh world (the server
-#                 resumes a saved session even without -loadSessionSave, so the
-#                 session has to be out of the way); player saves stay put
+#   hard-restart  kill the server without saving, move the running scenario's
+#                 session save into an archive folder and start it again on a
+#                 fresh world (the server resumes a saved session even without
+#                 -loadSessionSave, so the session has to be out of the way);
+#                 other scenarios' saves and player saves stay put
 #   soft-restart  ask the server to save and exit, then start it again; the
 #                 launch always passes -loadSessionSave, so it resumes from
 #                 that save
@@ -1447,7 +1458,7 @@ def _run_lifecycle(action, proc):
     archived = None
     try:
         try:
-            if proc is not None and action == "hard-reset":
+            if proc is not None and action == "hard-restart":
                 _LIFECYCLE["phase"] = "stopping"
                 proc.terminate()  # SIGTERM on Linux, an immediate kill on Windows
                 try:
@@ -1461,13 +1472,16 @@ def _run_lifecycle(action, proc):
                 _wait_for_exit(proc, "save and exit")
         except psutil.NoSuchProcess:
             pass  # it exited on its own in the meantime
-        if action == "hard-reset":
+        if action == "hard-restart":
+            # The scenario about to be launched is the one that starts fresh.
+            scenario = read_config().get("game", {}).get("scenarioId", "")
             _LIFECYCLE["phase"] = "archiving"
-            count, path = _archive_session_save()
-            archived = {"count": count, "path": path, "save_root": _save_root()}
+            count, path, folders = _archive_scenario_save(scenario)
+            archived = {"count": count, "path": path, "folders": folders,
+                        "scenario": scenario, "save_root": _save_root()}
         if action != "stop":
             _LIFECYCLE["phase"] = "starting"
-            launch_server(load_save=action != "hard-reset")
+            launch_server(load_save=action != "hard-restart")
             time.sleep(1)  # let the new process show up before reporting done
     except Exception as e:
         error = str(e)
@@ -1496,9 +1510,9 @@ def _begin_lifecycle(action, require_running):
 def api_stop():
     return _begin_lifecycle("stop", require_running=True)
 
-@app.route("/api/hard-reset", methods=["POST"])
-def api_hard_reset():
-    return _begin_lifecycle("hard-reset", require_running=False)
+@app.route("/api/hard-restart", methods=["POST"])
+def api_hard_restart():
+    return _begin_lifecycle("hard-restart", require_running=False)
 
 @app.route("/api/soft-restart", methods=["POST"])
 def api_soft_restart():
@@ -1538,7 +1552,8 @@ _monitor_start_lock = threading.Lock()
 _mon = {"path": None, "offset": 0, "midnight": 0.0, "days": 0, "last_sod": 0.0, "joined": {}}
 _mon_runtime = {"pid": None, "net": None, "net_at": 0.0, "net_up": None, "net_down": None}
 
-_ACTION_LABELS = {"start": "Start", "stop": "Stop", "soft-restart": "Soft restart", "hard-reset": "Hard reset"}
+_ACTION_LABELS = {"start": "Start", "stop": "Stop", "soft-restart": "Soft restart", "hard-restart": "Hard restart",
+                  "hard-reset": "Hard reset"}  # older timeline entries
 
 def record_event(kind, ts=None, **fields):
     entry = {"ts": round(ts if ts is not None else time.time(), 3), "type": kind, **fields}

@@ -9,7 +9,7 @@ A lightweight, self-hosted web panel for managing your **Arma Reforger dedicated
 ## Features
 
 - **One-command install** — sets up SteamCMD, downloads the Arma Reforger server and installs the panel automatically
-- **Server control** — Start, stop and hard reset your server from the browser
+- **Server control** — Start, stop, soft restart and hard restart your server from the browser
 - **Soft restart** — Save the game state, stop the server and bring it back up from that save
 - **Linux and Windows** — Runs on Ubuntu (with the installer) or on Windows Server (manual setup)
 - **Real-time monitoring** — Live CPU, RAM, server FPS and network (upload/download) charts updated every 3 seconds
@@ -107,7 +107,7 @@ There is no installer for Windows; setup takes a few manual steps.
 
 To start the panel at boot, put a shortcut to `python app.py` in the Startup folder of the user that runs the server, or run it as a service with [NSSM](https://nssm.cc/). With NSSM, run `nssm set <service> AppKillProcessTree 0` so that restarting the panel doesn't also kill the game server.
 
-**How stop and restart work on Windows.** The panel starts the server in its own console window, just like running it by hand. **Stop** and **Soft restart** send that console Ctrl+C, so the server saves the game state and exits cleanly. **Hard reset** kills the server immediately without saving, moves the world session save (`.save/game`) into `<PROFILE_DIR>/save-archive/<date_time>/game/`, then starts it again on a fresh world. Player saves (`.save/playersave`) and settings are left alone, and nothing is deleted: to go back to an archived world, stop the server and move the contents of its `game` folder back into `.save/game`. The panel asks for confirmation first. Start the server from the panel. If you start it by hand from a `.bat` file, the panel can still stop it, but the batch window will be left asking `Terminate batch job (Y/N)?`.
+**How stop and restart work on Windows.** The panel starts the server in its own console window, just like running it by hand. **Stop** and **Soft restart** send that console Ctrl+C, so the server saves the game state and exits cleanly. **Hard restart** kills the server immediately without saving, moves the session save of the scenario it is about to start (its folder in `.save/game`, e.g. `424AE7D5DFD33E8B-PvE-Kolgujev-Fixed-WCS-loadout`) into `<PROFILE_DIR>/save-archive/<date_time>/game/`, then starts it on a fresh world. Other scenarios' saves, player saves and settings are left alone, and nothing is deleted: to go back to an archived world, stop the server and move the folder back into `.save/game`. The panel asks for confirmation first. Start the server from the panel. If you start it by hand from a `.bat` file, the panel can still stop it, but the batch window will be left asking `Terminate batch job (Y/N)?`.
 
 ---
 
