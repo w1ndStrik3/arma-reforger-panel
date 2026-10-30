@@ -219,15 +219,30 @@ function modName(guid) {
 }
 
 // Mods in the current view (all installed, or those in the chosen list).
+// Mods in the current view: all installed, or a list's mods plus everything
+// they need (dependencies of dependencies included). pulledIn maps each mod
+// that is only there as a dependency to the listed mods that need it.
 function currentView() {
   const sel = document.getElementById('list-filter').value;
-  if (!sel) return { mods: DATA.mods, missing: [] };
-  const guids = DATA.modlists[sel] || [];
-  const wanted = new Set(guids);
-  const installed = new Set(DATA.mods.map(m => m.guid));
+  if (!sel) return { mods: DATA.mods, missing: [], pulledIn: {}, listedCount: DATA.mods.length };
+  const listed = DATA.modlists[sel] || [];
+  const listedSet = new Set(listed);
+  const byGuid = new Map(DATA.mods.map(m => [m.guid, m]));
+  const pulledIn = {};
+  listed.forEach(g => {
+    const m = byGuid.get(g);
+    // A listed mod that isn't installed has no addon.gproj to follow.
+    if (!m) return;
+    m.deps_all.forEach(d => {
+      if (!listedSet.has(d)) (pulledIn[d] = pulledIn[d] || []).push(m.name);
+    });
+  });
+  const all = [...listed, ...Object.keys(pulledIn)];
   return {
-    mods: DATA.mods.filter(m => wanted.has(m.guid)),
-    missing: guids.filter(g => !installed.has(g)),
+    mods: all.filter(g => byGuid.has(g)).map(g => byGuid.get(g)),
+    missing: all.filter(g => !byGuid.has(g)),
+    pulledIn,
+    listedCount: listed.filter(g => byGuid.has(g)).length,
   };
 }
 
@@ -275,14 +290,17 @@ function render() {
   const sum = list => list.reduce((t, m) => t + (m.size || 0), 0);
   const big = mods.filter(m => m.size > GB), mid = mods.filter(m => m.size >= MB100 && m.size <= GB), small = mods.filter(m => m.size < MB100);
   const stat = (k, v, n) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}${n != null ? ` <small>(${n} mod${n === 1 ? '' : 's'})</small>` : ''}</div></div>`;
+  const depCount = mods.length - view.listedCount;
   document.getElementById('stats').innerHTML =
-    stat('Mods', mods.length) + stat('Total size', fmtBytes(sum(mods))) +
+    stat('Mods', mods.length + (depCount ? ` <small>(${view.listedCount} listed + ${depCount} as ${depCount === 1 ? 'a dependency' : 'dependencies'})</small>` : '')) +
+    stat('Total size', fmtBytes(sum(mods))) +
     stat('Above 1 GB', fmtBytes(sum(big)), big.length) +
     stat('100 MB – 1 GB', fmtBytes(sum(mid)), mid.length) +
     stat('Below 100 MB', fmtBytes(sum(small)), small.length);
   document.getElementById('missing').textContent = view.missing.length
-    ? `${view.missing.length} mod${view.missing.length === 1 ? ' in this list is' : 's in this list are'} not installed: ` +
-      view.missing.map(g => modName(g) ? `${modName(g)} (${g})` : g).join(', ')
+    ? `${view.missing.length} mod${view.missing.length === 1 ? ' this list needs is' : 's this list needs are'} not installed: ` +
+      view.missing.map(g => (modName(g) ? `${modName(g)} (${g})` : g) +
+        (view.pulledIn[g] ? ` — dependency of ${view.pulledIn[g].join(', ')}` : '')).join('; ')
     : '';
 
   const rows = document.getElementById('rows');
@@ -295,7 +313,8 @@ function render() {
       ? `<div class="newer">workshop: ${esc(m.workshop_version)}</div>` : '';
     const isOpen = open.has(m.guid);
     return `<tr class="mod-row">
-      <td class="name">${esc(m.name)}</td>
+      <td class="name">${esc(m.name)}${view.pulledIn[m.guid]
+        ? ` <span class="chip indirect" title="Not in the list itself; needed by ${esc(view.pulledIn[m.guid].join(', '))}">dependency</span>` : ''}</td>
       <td class="mono">${esc(m.guid)}</td>
       <td class="num">${fmtBytes(m.size)}</td>
       <td class="nowrap">${esc(m.version || m.workshop_version || '—')}${newer}</td>
