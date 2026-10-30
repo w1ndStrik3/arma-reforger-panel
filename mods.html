@@ -343,6 +343,13 @@ function detailsRow(m) {
       ${via.length ? `<span class="muted">via ${esc(via.join(', '))}</span>` : ''}
     </div>`;
   }).join('') : '<div class="empty">No dependencies.</div>';
+  // Installed mods that list this one directly in their addon.gproj.
+  const requiredBy = DATA.mods.filter(x => x.deps_direct.includes(m.guid))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const dependents = requiredBy.length ? requiredBy.map(x => `<div class="dep">
+      <span>${esc(x.name)}</span>
+      <span class="mono muted">${x.guid}</span>
+    </div>`).join('') : '<div class="empty">No installed mod requires this one.</div>';
   const lists = m.modlists.length ? m.modlists.map(n =>
     `<div class="dep"><span>${esc(n)}</span>${n === DATA.selected ? '<span class="chip active">selected for server</span>' : ''}</div>`).join('')
     : '<div class="empty">Not in any mod list.</div>';
@@ -350,7 +357,8 @@ function detailsRow(m) {
   if (m.workshop_error) foot.push(`Workshop data unavailable: ${esc(m.workshop_error)}`);
   return `<tr class="details"><td colspan="${COLUMNS.length}">
     <div class="details-grid">
-      <div><h4>Dependencies (${m.deps_all.length}, including dependencies of dependencies)</h4>${deps}</div>
+      <div><h4>This mod requires: (${m.deps_all.length})</h4>${deps}</div>
+      <div><h4>Is required by: (${requiredBy.length})</h4>${dependents}</div>
       <div><h4>In mod lists (${m.modlists.length})</h4>${lists}</div>
     </div>
     <div class="details-foot">${foot.join('<br>')}</div>
