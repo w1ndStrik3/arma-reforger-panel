@@ -91,6 +91,12 @@
   .stat .k { font-size: 9.5px; font-weight: 600; letter-spacing: 0.15em; text-transform: uppercase; color: var(--muted); }
   .stat .v { font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 18px; color: #fff; }
   .stat .v small { font-family: 'Barlow', sans-serif; font-weight: 400; font-size: 12px; color: var(--muted); }
+  .stat.custom .range { display: flex; align-items: center; gap: 6px; margin: 3px 0 2px; font-size: 12px; color: var(--muted); }
+  .stat.custom input {
+    width: 76px; background: var(--surface); border: 1px solid var(--border); color: var(--text);
+    font-family: 'Barlow', sans-serif; font-size: 13px; padding: 3px 6px; outline: none;
+  }
+  .stat.custom input:focus { border-color: var(--accent); }
   #missing { font-size: 12.5px; color: var(--warn); margin-bottom: 10px; overflow-wrap: anywhere; }
 
   .table-wrap { overflow-x: auto; }
@@ -160,7 +166,18 @@
       <button class="btn-ghost" id="btn-refresh" onclick="refreshWorkshop()">Refresh workshop data</button>
       <span id="ws-status"></span>
     </div>
-    <div class="stats" id="stats"></div>
+    <div class="stats">
+      <div id="stats" style="display: contents"></div>
+      <div class="stat custom">
+        <div class="k">Custom range (MB, inclusive)</div>
+        <div class="range">
+          <input type="number" id="custom-min" min="0" step="any" placeholder="min" aria-label="Minimum size in MB" oninput="updateCustom()">
+          –
+          <input type="number" id="custom-max" min="0" step="any" placeholder="max" aria-label="Maximum size in MB" oninput="updateCustom()">
+        </div>
+        <div class="v" id="custom-v"></div>
+      </div>
+    </div>
     <div id="missing"></div>
     <div class="table-wrap">
       <table>
@@ -176,6 +193,7 @@ let DATA = null;            // last /api/mods/installed response
 const open = new Set();     // GUIDs whose details are expanded
 let sortKey = 'name', sortDir = 1;
 let pollTimer = null;
+let viewMods = [];          // mods in the table, for the custom size range
 
 const COLUMNS = [
   { key: 'name',         label: 'Name' },
@@ -297,6 +315,8 @@ function render() {
     stat('Above 1 GB', fmtBytes(sum(big)), big.length) +
     stat('100 MB – 1 GB', fmtBytes(sum(mid)), mid.length) +
     stat('Below 100 MB', fmtBytes(sum(small)), small.length);
+  viewMods = mods;
+  updateCustom();
   document.getElementById('missing').textContent = view.missing.length
     ? `${view.missing.length} mod${view.missing.length === 1 ? ' this list needs is' : 's this list needs are'} not installed: ` +
       view.missing.map(g => (modName(g) ? `${modName(g)} (${g})` : g) +
@@ -369,6 +389,23 @@ function detailsRow(m, shown) {
     </div>
     <div class="details-foot">${foot.join('<br>')}</div>
   </td></tr>`;
+}
+
+// Total size of the mods in the table whose size lies within the custom
+// range (MB, both ends inclusive; an empty field means no limit on that side).
+// Sizes are compared in MB rounded to 2 decimals, so a mod shown as "100 MB"
+// counts as 100 even if it is a few bytes over.
+function updateCustom() {
+  const MB = 1024 ** 2;
+  const lo = parseFloat(document.getElementById('custom-min').value);
+  const hi = parseFloat(document.getElementById('custom-max').value);
+  const out = document.getElementById('custom-v');
+  if (isNaN(lo) && isNaN(hi)) { out.innerHTML = '<small>enter a range</small>'; return; }
+  if (!isNaN(lo) && !isNaN(hi) && lo > hi) { out.innerHTML = '<small>min is above max</small>'; return; }
+  const mb = m => Math.round(m.size / MB * 100) / 100;
+  const hits = viewMods.filter(m => m.size != null && (isNaN(lo) || mb(m) >= lo) && (isNaN(hi) || mb(m) <= hi));
+  const total = hits.reduce((t, m) => t + m.size, 0);
+  out.innerHTML = `${fmtBytes(total)} <small>(${hits.length} mod${hits.length === 1 ? '' : 's'})</small>`;
 }
 
 function toggle(guid) {
