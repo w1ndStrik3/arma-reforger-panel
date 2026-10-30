@@ -10,3 +10,4 @@ modlists/
 .panel-state.json
 events.jsonl
 .monitor-state.json
+.workshop-cache.json

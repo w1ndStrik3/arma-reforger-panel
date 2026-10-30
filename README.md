@@ -19,6 +19,7 @@ A lightweight, self-hosted web panel for managing your **Arma Reforger dedicated
 - **Mission selector** — Vanilla scenarios plus any found in installed mods; the selected scenario's resource name (e.g. `{0648CDB32D6B02B3}Missions/SP02_AirSupport.conf`) is shown under the dropdown
 - **Mod lists** — Keep several named mod lists, edit each as JSON, and pick one from a dropdown; the selected list is written into `config.json` every time the server starts
 - **Config editor** — Edit server name, scenario, passwords, max players, view/grass distances, third person and cross-faction voice without touching the filesystem
+- **Installed mods page** — Every installed mod with size, version, workshop dates and game version, a workshop link, how many mods depend on it, its full (recursive) dependency tree from `addon.gproj`, which mod lists include it, and size totals; filterable by mod list
 - **Config file editor** — A "Config file" page to view and edit all of `config.json` as JSON (except the mod list, which Mod Lists manages), with validation and a `.bak` copy of the previous version
 - **PWA support** — Installable as a native app on Android and iOS
 - **Single config file** — All settings in one `config.env`, no code editing required
@@ -257,6 +258,7 @@ arma-reforger-panel/
 ├── index.html           # Main panel UI (English)
 ├── login.html           # Login screen
 ├── config.html          # config.json editor page
+├── mods.html            # Installed mods page
 ├── config.env           # Your local config (excluded from git)
 ├── config.env.example   # Config template
 ├── install.sh           # All-in-one installer

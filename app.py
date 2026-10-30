@@ -24,6 +24,8 @@ import threading
 import time
 import glob
 import calendar
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import shutil
 
@@ -1007,6 +1009,14 @@ def index():
     with open(os.path.join(_BASE_DIR, "index.html"), encoding="utf-8") as f:
         return f.read()
 
+@app.route("/mods")
+def mods_page():
+    if not session.get("logged_in"):
+        return redirect("/login")
+    _ensure_csrf()
+    with open(os.path.join(_BASE_DIR, "mods.html"), encoding="utf-8") as f:
+        return f.read()
+
 @app.route("/config")
 def config_page():
     if not session.get("logged_in"):
@@ -1937,6 +1947,291 @@ def api_server_stats():
     stats, path, error = read_server_stats()
     return jsonify({"ok": stats is not None, "stats": stats, "path": path, "error": error,
                     "now": time.time(), "running": get_server_pid() is not None})
+
+# ─── INSTALLED MODS ──────────────────────────────────────────────────────────
+#
+# The Mods page lists every mod installed on the server. From disk: the GUID,
+# installed version and size (from the mod's folder and its `meta` file) and
+# the dependencies (from `addon.gproj`). From the mod's workshop page: the
+# name, latest version, created/modified dates and game version. Workshop
+# pages are fetched in the background and cached in .workshop-cache.json.
+
+WORKSHOP_URL         = "https://reforger.armaplatform.com/workshop/{guid}"
+_WORKSHOP_CACHE_FILE = os.path.join(_BASE_DIR, ".workshop-cache.json")
+_WORKSHOP_TTL        = 12 * 3600   # refetch successful pages after this long
+_WORKSHOP_ERROR_TTL  = 3600        # retry failed pages after this long
+# Arma Reforger's own GUID: listed first in every addon.gproj's Dependencies.
+_REFORGER_CORE_GUID  = "58D0FB3206B6F859"
+_GUID_RE             = re.compile(r"^[0-9A-F]{16}$")
+
+_ws_lock = threading.Lock()
+_ws_cache = None          # guid -> {"fetched_at", "data"} or {"fetched_at", "error"}
+_ws_queued = set()
+_ws_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="workshop")
+
+def _gproj_info(addon_dir):
+    """(GUID, title, dependency GUIDs) from addon.gproj, or Nones/[]."""
+    try:
+        with open(os.path.join(addon_dir, "addon.gproj"), encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None, None, []
+    guid = re.search(r'\bGUID\s+"([0-9A-Fa-f]{16})"', text)
+    title = re.search(r'\bTITLE\s+"([^"]+)"', text)
+    deps = []
+    block = re.search(r"\bDependencies\s*\{([^}]*)\}", text)
+    if block:
+        deps = [g.upper() for g in re.findall(r"([0-9A-Fa-f]{16})", block.group(1))]
+    # The first entry is Arma Reforger itself.
+    if _REFORGER_CORE_GUID in deps:
+        deps.remove(_REFORGER_CORE_GUID)
+    elif deps:
+        deps = deps[1:]
+    return (guid.group(1).upper() if guid else None,
+            title.group(1).strip() if title else None,
+            list(dict.fromkeys(deps)))
+
+def _meta_info(addon_dir):
+    """The mod's `meta` file (written by the server's downloader), or {}."""
+    try:
+        with open(os.path.join(addon_dir, "meta"), encoding="utf-8-sig") as f:
+            data = json.load(f)
+        meta = data.get("meta") if isinstance(data, dict) else None
+        return meta if isinstance(meta, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def _folder_size(path):
+    total = 0
+    for dirpath, _dirs, files in os.walk(path):
+        for fn in files:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, fn))
+            except OSError:
+                pass
+    return total
+
+def scan_installed_mods():
+    """Every installed mod (workshop addon folders, not the game's own data):
+    {guid: {guid, name, version, size, path, deps}}."""
+    mods = {}
+    for root, is_vanilla in _candidate_addon_roots():
+        if is_vanilla or not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root)):
+            addon_dir = os.path.join(root, name)
+            if not os.path.isdir(addon_dir):
+                continue
+            has_gproj = os.path.isfile(os.path.join(addon_dir, "addon.gproj"))
+            if not has_gproj and not os.path.isfile(os.path.join(addon_dir, "meta")):
+                continue
+            guid, title, deps = _gproj_info(addon_dir)
+            meta = _meta_info(addon_dir)
+            guid = guid or str(meta.get("id") or "").upper()
+            if not guid:
+                m = re.search(r"([0-9A-Fa-f]{16})$", name)
+                guid = m.group(1).upper() if m else None
+            if not guid or not _GUID_RE.match(guid) or guid in mods:
+                continue
+            versions = meta.get("versions") if isinstance(meta.get("versions"), list) else []
+            v0 = versions[0] if versions and isinstance(versions[0], dict) else {}
+            mods[guid] = {
+                "guid": guid,
+                "name": str(meta.get("name") or title or name).strip(),
+                "version": str(v0.get("version") or meta.get("version") or "") or None,
+                "size": _folder_size(addon_dir),
+                "path": addon_dir,
+                "deps": deps,
+            }
+    return mods
+
+def _all_dependencies(guid, mods):
+    """Every dependency of `guid`, direct and indirect, in discovery order.
+    Dependencies that aren't installed are listed but can't be followed
+    further (their addon.gproj isn't on disk)."""
+    seen, order = set(), []
+    stack = list(reversed(mods.get(guid, {}).get("deps", [])))
+    while stack:
+        g = stack.pop()
+        if g in seen or g == guid:
+            continue
+        seen.add(g)
+        order.append(g)
+        stack.extend(reversed(mods.get(g, {}).get("deps", [])))
+    return order
+
+# Workshop pages are a Next.js app: the asset's data is embedded as JSON in
+# <script id="__NEXT_DATA__">. The keys below are tried in order; the first
+# one found (nearest the asset object's top level) wins.
+_WS_FIELDS = {
+    "name":         ("name", "title"),
+    "version":      ("currentVersionNumber", "version", "versionNumber"),
+    "size":         ("currentVersionSize", "totalFileSize", "fileSize", "size"),
+    "created":      ("createdAt", "created", "publishedAt", "createDate"),
+    "updated":      ("updatedAt", "lastModified", "modifiedAt", "updated"),
+    "game_version": ("gameVersion", "gameVersionNumber", "requiredGameVersion"),
+}
+_NEXT_DATA_RE = re.compile(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
+
+def _walk_dicts(obj, depth=0, max_depth=12):
+    """Yield (depth, dict) for every dict inside obj, breadth-first."""
+    queue = [(0, obj)]
+    while queue:
+        d, o = queue.pop(0)
+        if isinstance(o, dict):
+            yield d, o
+            children = o.values()
+        elif isinstance(o, list):
+            children = o
+        else:
+            continue
+        if d < max_depth:
+            queue.extend((d + 1, c) for c in children if isinstance(c, (dict, list)))
+
+def _find_field(asset, keys):
+    for key in keys:
+        for _d, o in _walk_dicts(asset, max_depth=3):
+            v = o.get(key)
+            if v not in (None, "", [], {}) and not isinstance(v, (dict, list)):
+                return v
+    return None
+
+def _parse_workshop_page(html, guid):
+    m = _NEXT_DATA_RE.search(html)
+    if not m:
+        raise ValueError("no embedded data (__NEXT_DATA__) on the page")
+    data = json.loads(m.group(1))
+    # The asset is the object whose id is this mod's GUID.
+    asset = None
+    for _d, o in _walk_dicts(data):
+        if any(str(o.get(k, "")).upper() == guid for k in ("id", "guid", "assetId")) and ("name" in o or "title" in o):
+            asset = o
+            break
+    if asset is None:
+        raise ValueError("mod data not found in the page's embedded data")
+    out = {k: _find_field(asset, keys) for k, keys in _WS_FIELDS.items()}
+    if isinstance(out["size"], str):
+        out["size"] = _parse_size(out["size"])
+    return out
+
+def _parse_size(text):
+    m = re.match(r"\s*([\d.,]+)\s*([KMGT]?i?B)\b", text or "", re.I)
+    if not m:
+        return None
+    mult = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
+    return int(float(m.group(1).replace(",", "")) * mult.get(m.group(2).upper().replace("I", ""), 1))
+
+def _ws_load_cache():
+    global _ws_cache
+    if _ws_cache is None:
+        try:
+            with open(_WORKSHOP_CACHE_FILE, encoding="utf-8") as f:
+                _ws_cache = json.load(f)
+        except (OSError, ValueError):
+            _ws_cache = {}
+    return _ws_cache
+
+def _ws_save_cache():
+    tmp = _WORKSHOP_CACHE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(_ws_cache, f, ensure_ascii=False)
+    os.replace(tmp, _WORKSHOP_CACHE_FILE)
+
+def _ws_fetch(guid):
+    try:
+        req = urllib.request.Request(WORKSHOP_URL.format(guid=guid),
+                                     headers={"User-Agent": "Mozilla/5.0 (arma-reforger-panel)"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            html = r.read().decode("utf-8", errors="replace")
+        entry = {"fetched_at": time.time(), "data": _parse_workshop_page(html, guid)}
+    except Exception as e:
+        entry = {"fetched_at": time.time(), "error": str(e)[:300]}
+    with _ws_lock:
+        _ws_cache[guid] = entry
+        _ws_queued.discard(guid)
+        try:
+            _ws_save_cache()
+        except OSError:
+            pass
+
+def _ws_queue_stale(guids, force=False):
+    """Fetch workshop pages that are missing or out of date, in the background."""
+    now = time.time()
+    with _ws_lock:
+        cache = _ws_load_cache()
+        for g in guids:
+            entry = cache.get(g)
+            ttl = _WORKSHOP_ERROR_TTL if entry and "error" in entry else _WORKSHOP_TTL
+            if g in _ws_queued or (entry and not force and now - entry["fetched_at"] < ttl):
+                continue
+            _ws_queued.add(g)
+            _ws_pool.submit(_ws_fetch, g)
+        return len(_ws_queued)
+
+def _modlist_membership():
+    """guid -> [names of the mod lists that include it]."""
+    member = {}
+    for name in list_modlists():
+        try:
+            mods = load_modlist(name)
+        except (OSError, ValueError):
+            continue
+        for m in mods:
+            member.setdefault(str(m.get("modId", "")).upper(), []).append(name)
+    return member
+
+@app.route("/api/mods/installed")
+def api_mods_installed():
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    installed = scan_installed_mods()
+    membership = _modlist_membership()
+    all_deps = {g: _all_dependencies(g, installed) for g in installed}
+    # Dependencies that aren't installed are fetched too, for their names.
+    wanted = set(installed) | {d for deps in all_deps.values() for d in deps}
+    pending = _ws_queue_stale(sorted(wanted))
+    with _ws_lock:
+        cache = dict(_ws_load_cache())
+    def ws(g):
+        e = cache.get(g) or {}
+        return e.get("data"), e.get("error")
+    mods = []
+    for g, m in installed.items():
+        data, error = ws(g)
+        data = data or {}
+        mods.append({
+            **{k: m[k] for k in ("guid", "version", "size", "path")},
+            "name": data.get("name") or m["name"],
+            "workshop_version": data.get("version"),
+            "workshop_size": data.get("size"),
+            "created": data.get("created"),
+            "updated": data.get("updated"),
+            "game_version": data.get("game_version"),
+            "workshop_error": error,
+            "deps_direct": m["deps"],
+            "deps_all": all_deps[g],
+            "modlists": membership.get(g, []),
+        })
+    names = {g: ((ws(g)[0] or {}).get("name") or (installed.get(g) or {}).get("name")) for g in wanted}
+    lists = {}
+    for name in list_modlists():
+        try:
+            lists[name] = [str(x.get("modId", "")).upper() for x in load_modlist(name)]
+        except (OSError, ValueError):
+            pass
+    return jsonify({"ok": True, "mods": mods, "names": names, "modlists": lists,
+                    "selected": get_selected_modlist(), "workshop_pending": pending,
+                    "workshop_url": WORKSHOP_URL})
+
+@app.route("/api/mods/workshop-refresh", methods=["POST"])
+def api_mods_workshop_refresh():
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    err = _csrf_required()
+    if err: return err
+    installed = scan_installed_mods()
+    wanted = set(installed) | {d for g in installed for d in _all_dependencies(g, installed)}
+    return jsonify({"ok": True, "workshop_pending": _ws_queue_stale(sorted(wanted), force=True)})
 
 if __name__ == "__main__":
     start_monitor()

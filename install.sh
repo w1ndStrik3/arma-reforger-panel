@@ -87,6 +87,7 @@ if [[ "$MODE" == "update" ]]; then
     cp "$SCRIPT_DIR/index.html" "$PANEL_DIR_EXISTING/"
     cp "$SCRIPT_DIR/login.html" "$PANEL_DIR_EXISTING/"
     cp "$SCRIPT_DIR/config.html" "$PANEL_DIR_EXISTING/"
+    cp "$SCRIPT_DIR/mods.html" "$PANEL_DIR_EXISTING/"
     cp "$SCRIPT_DIR/static/"*   "$PANEL_DIR_EXISTING/static/"
     chown -R "$EXISTING_USER:$EXISTING_USER" "$PANEL_DIR_EXISTING"
     systemctl restart arma-panel
@@ -297,7 +298,7 @@ fi
 mkdir -p "$PANEL_DIR/static"
 
 # Copy files from script directory
-for f in app.py index.html login.html config.html; do
+for f in app.py index.html login.html config.html mods.html; do
     if [ -f "$SCRIPT_DIR/$f" ]; then
         cp "$SCRIPT_DIR/$f" "$PANEL_DIR/"
     else
