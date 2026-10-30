@@ -108,6 +108,8 @@
     transition: border-color 0.2s, color 0.2s;
   }
   .btn-logout:hover { border-color: var(--accent); color: var(--accent); }
+  a.btn-logout { text-decoration: none; display: inline-block; }
+  .header-actions { display: flex; gap: 10px; }
 
   .card {
     background: var(--surface);
@@ -504,7 +506,10 @@
       <div class="tag">&#9632; Server Management Panel</div>
       <h1>ARMA <span>REFORGER</span></h1>
     </div>
-    <button class="btn-logout" onclick="doLogout()">Logout ↗</button>
+    <div class="header-actions">
+      <a class="btn-logout" href="/config" title="View and edit config.json">Config file</a>
+      <button class="btn-logout" onclick="doLogout()">Logout ↗</button>
+    </div>
   </header>
 
   <!-- Status -->

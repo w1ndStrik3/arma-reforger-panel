@@ -24,6 +24,8 @@ import threading
 import time
 import glob
 import calendar
+import hashlib
+import shutil
 
 IS_WINDOWS = os.name == "nt"
 
@@ -774,6 +776,12 @@ def write_config(cfg):
     with open(SERVER_CONFIG, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent="\t")
 
+def read_config_strict():
+    """Like read_config(), but raises instead of returning {} on a missing or
+    broken file, for callers that write the result back."""
+    with open(SERVER_CONFIG, encoding="utf-8") as f:
+        return json.load(f)
+
 # ─── PERSISTENCE ─────────────────────────────────────────────────────────────
 #
 # Reforger session save/load. The toggle is the presence of a top-level
@@ -861,7 +869,6 @@ def _flush_saves():
     session + per-player data). `.save/settings/` is left alone — it holds
     non-session config the server regenerates from. Returns the count of files
     deleted."""
-    import shutil
     root = _save_root()
     if not os.path.isdir(root):
         return 0
@@ -907,7 +914,6 @@ def _archive_scenario_save(scenario_id):
     moving the folder back restores that world. Returns (files moved, archive
     path or None if there was nothing to move, folder names moved). Raises if
     a file can't be moved, so a half-moved save is never launched."""
-    import shutil
     folders = _scenario_save_folders(scenario_id)
     if not folders:
         return 0, None, []
@@ -999,6 +1005,14 @@ def index():
         return redirect("/login")
     _ensure_csrf()
     with open(os.path.join(_BASE_DIR, "index.html"), encoding="utf-8") as f:
+        return f.read()
+
+@app.route("/config")
+def config_page():
+    if not session.get("logged_in"):
+        return redirect("/login")
+    _ensure_csrf()
+    with open(os.path.join(_BASE_DIR, "config.html"), encoding="utf-8") as f:
         return f.read()
 
 @app.route("/login", methods=["GET", "POST"])
@@ -1144,6 +1158,95 @@ def api_config():
         return jsonify({"ok": True, "restart_required": get_server_pid() is not None})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
+
+# ─── RAW CONFIG EDITOR ───────────────────────────────────────────────────────
+#
+# The /config page edits config.json as JSON, except game.mods: the mod list
+# is managed in Mod Lists and rewritten at every launch, so it is left out of
+# the editor and put back in its old place on save. A version hash of the
+# rest of the file stops a save from overwriting changes made in the meantime
+# (by the panel's other cards or by hand).
+
+def _config_without_mods(cfg):
+    cfg = json.loads(json.dumps(cfg))  # deep copy
+    if isinstance(cfg.get("game"), dict):
+        cfg["game"].pop("mods", None)
+    return cfg
+
+def _config_version(cfg):
+    data = json.dumps(_config_without_mods(cfg), sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()[:16]
+
+def _insert_mods(new_game, old_game, mods):
+    """new_game with "mods" added back where it sat in old_game: after the key
+    that preceded it, if that key still exists, else at the end."""
+    old_keys = list(old_game)
+    items = list(new_game.items())
+    pos = len(items)
+    if "mods" in old_keys:
+        i = old_keys.index("mods")
+        if i == 0:
+            pos = 0
+        elif old_keys[i - 1] in new_game:
+            pos = list(new_game).index(old_keys[i - 1]) + 1
+    items.insert(pos, ("mods", mods))
+    return dict(items)
+
+@app.route("/api/config-file")
+def api_config_file_get():
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        cfg = read_config_strict()
+    except (OSError, ValueError) as e:
+        # Show the raw text so a broken file can be repaired from here.
+        try:
+            with open(SERVER_CONFIG, encoding="utf-8") as f:
+                raw = f.read()
+        except OSError:
+            raw = ""
+        return jsonify({"ok": True, "text": raw, "version": None, "path": SERVER_CONFIG,
+                        "warning": f"config.json can't be read as JSON ({e}); it is shown as-is."})
+    return jsonify({"ok": True, "path": SERVER_CONFIG, "version": _config_version(cfg),
+                    "text": json.dumps(_config_without_mods(cfg), indent="\t", ensure_ascii=False)})
+
+@app.route("/api/config-file", methods=["POST"])
+def api_config_file_save():
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    err = _csrf_required()
+    if err: return err
+    data = request.get_json(silent=True) or {}
+    try:
+        new = json.loads(str(data.get("text", "")))
+    except json.JSONDecodeError as e:
+        return jsonify({"ok": False, "error": f"Invalid JSON: {e.msg} at line {e.lineno} col {e.colno}"})
+    if not isinstance(new, dict):
+        return jsonify({"ok": False, "error": "config.json must be a JSON object: { ... }"})
+    if not isinstance(new.get("game"), dict):
+        return jsonify({"ok": False, "error": 'config.json needs a "game" object'})
+    if "mods" in new["game"]:
+        return jsonify({"ok": False, "error": 'Remove "mods" from "game": mods are managed in Mod Lists'})
+    try:
+        current = read_config_strict()
+    except (OSError, ValueError):
+        current = None  # missing or broken: nothing to merge or compare with
+    if current is not None and data.get("version") != _config_version(current):
+        return jsonify({"ok": False, "conflict": True,
+                        "error": "config.json was changed since you opened it. Reload to see the "
+                                 "current file (copy your edits first if you want to keep them)."})
+    old_game = (current or {}).get("game") if isinstance((current or {}).get("game"), dict) else {}
+    # With no readable old file, mods start empty; the selected mod list is
+    # written in at the next launch anyway.
+    new["game"] = _insert_mods(new["game"], old_game, old_game.get("mods", []))
+    try:
+        if os.path.exists(SERVER_CONFIG):
+            shutil.copy2(SERVER_CONFIG, SERVER_CONFIG + ".bak")
+        write_config(new)
+    except OSError as e:
+        return jsonify({"ok": False, "error": str(e)})
+    return jsonify({"ok": True, "version": _config_version(new),
+                    "restart_required": get_server_pid() is not None})
 
 @app.route("/api/persistence", methods=["GET"])
 def api_persistence_get():
@@ -1322,8 +1425,7 @@ def apply_selected_modlist():
     mods = load_modlist(name)
     # Not read_config(): it returns {} on a read error, and writing that back
     # would wipe the rest of the server config.
-    with open(SERVER_CONFIG, encoding="utf-8") as f:
-        cfg = json.load(f)
+    cfg = read_config_strict()
     cfg.setdefault("game", {})["mods"] = mods
     write_config(cfg)
 

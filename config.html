@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Arma Reforger — config.json</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#c8a84b">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;900&family=Barlow:wght@400;500&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:      #0a0c0f;
+    --surface: #111418;
+    --border:  #1e2530;
+    --accent:  #c8a84b;
+    --accent2: #e8c96a;
+    --text:    #d4cfc6;
+    --muted:   #5a6070;
+    --online:  #4caf7d;
+    --offline: #d64c4c;
+    --warn:    #e0913a;
+  }
+
+  body { background: var(--bg); color: var(--text); font-family: 'Barlow', sans-serif; min-height: 100vh; }
+  body::before {
+    content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background-image:
+      linear-gradient(rgba(200,168,75,0.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(200,168,75,0.02) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+
+  .layout { position: relative; z-index: 1; max-width: 1100px; margin: 0 auto; padding: 40px 24px 60px; }
+
+  header {
+    display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+    margin-bottom: 32px; padding-bottom: 20px; border-bottom: 1px solid var(--border);
+  }
+  .header-left .tag {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.3em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 6px;
+  }
+  .header-left h1 {
+    font-family: 'Barlow Condensed', sans-serif; font-weight: 900; font-size: 38px;
+    letter-spacing: 0.06em; color: #fff; line-height: 1;
+  }
+  .header-left h1 span { color: var(--accent); }
+  .header-actions { display: flex; gap: 10px; }
+  .btn-head {
+    background: transparent; border: 1px solid var(--border); color: var(--muted);
+    font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.2em;
+    text-transform: uppercase; padding: 8px 16px; cursor: pointer; text-decoration: none;
+    transition: border-color 0.2s, color 0.2s;
+  }
+  .btn-head:hover { border-color: var(--accent); color: var(--accent); }
+
+  .card { background: var(--surface); border: 1px solid var(--border); padding: 22px 26px; }
+  .card-label {
+    font-size: 10px; font-weight: 600; letter-spacing: 0.3em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 10px;
+  }
+  .path { font-family: 'Roboto Mono', monospace; font-size: 12px; color: var(--text); overflow-wrap: anywhere; margin-bottom: 6px; }
+  .hint { font-size: 12px; color: var(--muted); line-height: 1.6; margin-bottom: 14px; }
+  .hint code { font-family: 'Roboto Mono', monospace; color: var(--text); }
+
+  #editor {
+    width: 100%; height: 65vh; min-height: 320px; resize: vertical;
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    font-family: 'Roboto Mono', monospace; font-size: 12.5px; line-height: 1.55;
+    padding: 12px 14px; outline: none; tab-size: 4; white-space: pre;
+  }
+  #editor:focus { border-color: var(--accent); }
+  #editor.invalid { border-color: var(--offline); }
+
+  .bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+  .btn {
+    background: var(--accent); border: none; color: #0a0c0f;
+    font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 13px;
+    letter-spacing: 0.2em; text-transform: uppercase; padding: 12px 28px; cursor: pointer;
+    clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 0 100%);
+    transition: background 0.2s;
+  }
+  .btn:hover { background: var(--accent2); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  .btn.ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+  #validity { font-family: 'Roboto Mono', monospace; font-size: 12px; margin-left: auto; overflow-wrap: anywhere; }
+  #validity.ok  { color: var(--online); }
+  #validity.bad { color: var(--offline); }
+  #message { margin-top: 12px; font-size: 13px; min-height: 1.2em; overflow-wrap: anywhere; }
+  #message.ok    { color: var(--online); }
+  #message.error { color: var(--offline); }
+  #message.warn  { color: var(--warn); }
+</style>
+</head>
+<body>
+<div class="layout">
+
+  <header>
+    <div class="header-left">
+      <div class="tag">&#9632; Server Management Panel</div>
+      <h1>CONFIG<span>.JSON</span></h1>
+    </div>
+    <div class="header-actions">
+      <a class="btn-head" href="/">← Back to panel</a>
+      <button class="btn-head" onclick="doLogout()">Logout ↗</button>
+    </div>
+  </header>
+
+  <div class="card">
+    <div class="card-label">Server config file</div>
+    <div class="path" id="path">Loading…</div>
+    <div class="hint">
+      Everything in the file except <code>game.mods</code>: mods are managed in <strong>Mod Lists</strong> on the
+      main page and written into the file at every start, so they are left out here and kept as they are when
+      you save. Saving keeps the previous version as <code>config.json.bak</code> next to it. Changes take effect
+      the next time the server starts.
+    </div>
+    <textarea id="editor" spellcheck="false" autocomplete="off" autocapitalize="off" aria-label="config.json"></textarea>
+    <div class="bar">
+      <button class="btn" id="btn-save" onclick="save()">Save</button>
+      <button class="btn ghost" onclick="formatJson()">Format</button>
+      <button class="btn ghost" onclick="reload()">Reload</button>
+      <span id="validity"></span>
+    </div>
+    <div id="message"></div>
+  </div>
+
+</div>
+<script>
+let CSRF = '';
+let version = null;   // version of the file the editor was loaded from
+let savedText = '';   // editor text as last loaded/saved, to spot unsaved edits
+
+const editor = document.getElementById('editor');
+
+function setMessage(text, type = '') {
+  const el = document.getElementById('message');
+  el.className = type;
+  el.textContent = text;
+}
+
+// Validate as you type. Browsers word JSON errors differently; when they give
+// a character position, turn it into a line/column.
+function checkJson() {
+  const v = document.getElementById('validity');
+  try {
+    const parsed = JSON.parse(editor.value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('must be a JSON object { … }');
+    v.className = 'ok';
+    v.textContent = '✓ valid JSON';
+    editor.classList.remove('invalid');
+    return parsed;
+  } catch (e) {
+    let msg = e.message;
+    const m = /position (\d+)/.exec(msg);
+    if (m && !/line \d+/.test(msg)) {
+      const before = editor.value.slice(0, Number(m[1])).split('\n');
+      msg += ` (line ${before.length}, col ${before[before.length - 1].length + 1})`;
+    }
+    v.className = 'bad';
+    v.textContent = '✗ ' + msg;
+    editor.classList.add('invalid');
+    return null;
+  }
+}
+
+async function load() {
+  try {
+    const r = await fetch('/api/config-file');
+    if (r.status === 401) { window.location.href = '/login'; return; }
+    const d = await r.json();
+    document.getElementById('path').textContent = d.path || '';
+    editor.value = savedText = d.text || '';
+    version = d.version;
+    checkJson();
+    if (d.warning) setMessage(d.warning, 'warn');
+  } catch (e) { setMessage('Could not load config.json', 'error'); }
+}
+
+async function reload() {
+  if (editor.value !== savedText && !confirm('Discard your unsaved changes and reload config.json?')) return;
+  setMessage('');
+  await load();
+}
+
+function formatJson() {
+  const parsed = checkJson();
+  if (!parsed) { setMessage('Fix the JSON error before formatting', 'error'); return; }
+  editor.value = JSON.stringify(parsed, null, '\t');
+}
+
+async function save() {
+  if (!checkJson()) { setMessage('Fix the JSON error before saving', 'error'); return; }
+  const btn = document.getElementById('btn-save');
+  btn.disabled = true;
+  setMessage('Saving…');
+  try {
+    if (!CSRF) CSRF = (await (await fetch('/api/csrf')).json()).csrf || '';
+    const r = await fetch('/api/config-file', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF },
+      body: JSON.stringify({ text: editor.value, version, _csrf: CSRF }),
+    });
+    if (r.status === 401) { window.location.href = '/login'; return; }
+    if (r.status === 403) { CSRF = ''; setMessage('Session check failed; press Save again', 'error'); return; }
+    const d = await r.json();
+    if (d.ok) {
+      version = d.version;
+      savedText = editor.value;
+      setMessage(d.restart_required ? 'Saved. Restart the server for the changes to take effect.' : 'Saved.', 'ok');
+    } else {
+      setMessage(d.error || 'Save failed', 'error');
+    }
+  } catch (e) {
+    setMessage('Connection error', 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function doLogout() {
+  await fetch('/logout', { method: 'POST' });
+  window.location.href = '/login';
+}
+
+editor.addEventListener('input', checkJson);
+editor.addEventListener('keydown', e => {
+  // Tab inserts a tab (the file is tab-indented) instead of leaving the editor.
+  if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+    e.preventDefault();
+    const { selectionStart: a, selectionEnd: b } = editor;
+    editor.setRangeText('\t', a, b, 'end');
+    checkJson();
+  }
+});
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); save(); }
+});
+window.addEventListener('beforeunload', e => {
+  if (editor.value !== savedText) { e.preventDefault(); e.returnValue = ''; }
+});
+
+load();
+</script>
+</body>
+</html>
