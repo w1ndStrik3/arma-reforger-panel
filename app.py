@@ -2061,8 +2061,11 @@ def _all_dependencies(guid, mods):
     return order
 
 # Workshop pages are a Next.js app: the asset's data is embedded as JSON in
-# <script id="__NEXT_DATA__">. The keys below are tried in order; the first
-# one found (nearest the asset object's top level) wins.
+# <script id="__NEXT_DATA__">, at props.pageProps.asset (checked October
+# 2026: name, currentVersionNumber, currentVersionSize, createdAt, updatedAt,
+# gameVersion). The keys below are tried in order; the first one found
+# (nearest the asset object's top level) wins, so a nested gameVersion such
+# as dependencyTree.gameVersion isn't picked up.
 _WS_FIELDS = {
     "name":         ("name", "title"),
     "version":      ("currentVersionNumber", "version", "versionNumber"),
@@ -2101,9 +2104,12 @@ def _parse_workshop_page(html, guid):
     if not m:
         raise ValueError("no embedded data (__NEXT_DATA__) on the page")
     data = json.loads(m.group(1))
-    # The asset is the object whose id is this mod's GUID.
-    asset = None
-    for _d, o in _walk_dicts(data):
+    # The asset is the object whose id is this mod's GUID: normally
+    # props.pageProps.asset; otherwise search for it.
+    asset = ((data.get("props") or {}).get("pageProps") or {}).get("asset")
+    if not (isinstance(asset, dict) and str(asset.get("id", "")).upper() == guid):
+        asset = None
+    for _d, o in ([] if asset else _walk_dicts(data)):
         if any(str(o.get(k, "")).upper() == guid for k in ("id", "guid", "assetId")) and ("name" in o or "title" in o):
             asset = o
             break
