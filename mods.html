@@ -308,6 +308,7 @@ function render() {
     rows.innerHTML = `<tr><td class="empty" colspan="${COLUMNS.length}">${DATA.mods.length ? 'No installed mods in this list.' : 'No installed mods found. Mods appear here once the server has downloaded them (set WORKSHOP_DIR in config.env if they live elsewhere).'}</td></tr>`;
     return;
   }
+  const shown = new Set(mods.map(x => x.guid));
   rows.innerHTML = mods.map(m => {
     const newer = m.workshop_version && m.version && m.workshop_version !== m.version
       ? `<div class="newer">workshop: ${esc(m.workshop_version)}</div>` : '';
@@ -324,11 +325,16 @@ function render() {
       <td><a class="ws" href="${esc(DATA.workshop_url.replace('{guid}', m.guid))}" target="_blank" rel="noopener">workshop link</a></td>
       <td class="num" title="${esc(m.dependentNames.join(', '))}">${m.dependents}</td>
       <td><button class="arrow${isOpen ? ' open' : ''}" onclick="toggle('${m.guid}')" aria-label="Details">▼</button></td>
-    </tr>` + (isOpen ? detailsRow(m) : '');
+    </tr>` + (isOpen ? detailsRow(m, shown) : '');
   }).join('');
 }
 
-function detailsRow(m) {
+// `shown`: the GUIDs in the table right now. "Is required by" only lists those,
+// so with a mod list selected it names the mods of that list (directly or as
+// dependencies). "This mod requires" needs no filter: a mod's dependencies
+// are always in the same view as the mod itself, apart from ones that aren't
+// installed, which stay listed (marked) as a warning.
+function detailsRow(m, shown) {
   const installed = new Map(DATA.mods.map(x => [x.guid, x]));
   // For an indirect dependency, name the dependencies that pull it in.
   const chain = [m, ...m.deps_all.map(g => installed.get(g)).filter(Boolean)];
@@ -344,12 +350,12 @@ function detailsRow(m) {
     </div>`;
   }).join('') : '<div class="empty">No dependencies.</div>';
   // Installed mods that list this one directly in their addon.gproj.
-  const requiredBy = DATA.mods.filter(x => x.deps_direct.includes(m.guid))
+  const requiredBy = DATA.mods.filter(x => shown.has(x.guid) && x.deps_direct.includes(m.guid))
     .sort((a, b) => a.name.localeCompare(b.name));
   const dependents = requiredBy.length ? requiredBy.map(x => `<div class="dep">
       <span>${esc(x.name)}</span>
       <span class="mono muted">${x.guid}</span>
-    </div>`).join('') : '<div class="empty">No installed mod requires this one.</div>';
+    </div>`).join('') : `<div class="empty">${document.getElementById('list-filter').value ? 'No mod in this list requires this one.' : 'No installed mod requires this one.'}</div>`;
   const lists = m.modlists.length ? m.modlists.map(n =>
     `<div class="dep"><span>${esc(n)}</span>${n === DATA.selected ? '<span class="chip active">selected for server</span>' : ''}</div>`).join('')
     : '<div class="empty">Not in any mod list.</div>';
