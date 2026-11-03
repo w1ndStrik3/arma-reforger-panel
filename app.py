@@ -103,22 +103,47 @@ _CTRL_C_HELPER = os.path.join(_BASE_DIR, "win_ctrl_c.py")
 # ─── SERVERS ──────────────────────────────────────────────────────────────────
 #
 # The panel runs two server instances from the same installation. Server 2
-# differs only in its config file: config2.json next to config.json, or
-# SERVER2_CONFIG in config.env. Both share the profile folder, so their logs
-# land in the same folder and are told apart by the "-config" path each log
-# records at startup; running servers are told apart by their command line.
+# has its own config file (config2.json next to config.json, or
+# SERVER2_CONFIG) and its own profile folder (SERVER2_PROFILE), passed as
+# -profile: per Bohemia's Startup Parameters page, -profile X keeps the
+# profile (saves, the stats file) in X/profile and logs in X/logs. So that it
+# doesn't download every mod a second time into its profile, it also gets
+# -addonDownloadDir pointing at the folder that holds server 1's "addons"
+# folder (downloads go to <that folder>/addons).
+# Running servers are told apart by the -config path on their command line,
+# and logs by the -config path on their CLI Params line (which also keeps
+# them apart if both ever share a logs folder).
 # Each request names its server in an X-Server header (the pages add it), and
 # srv() returns that server; the monitor and lifecycle threads set it too.
 
 SERVER2_CONFIG = _cfg.get("SERVER2_CONFIG", os.path.join(os.path.dirname(SERVER_CONFIG), "config2.json"))
+# Server 1's profile root is the folder holding its "profile" and "logs"
+# folders (e.g. Documents\My Games\ArmaReforger); server 2's sits next to it.
+_PROFILE_ROOT_1 = os.path.dirname(PROFILE_DIR.rstrip("/\\"))
+SERVER2_PROFILE = _cfg.get("SERVER2_PROFILE", "").strip() or \
+    os.path.join(os.path.dirname(_PROFILE_ROOT_1), os.path.basename(_PROFILE_ROOT_1) + "-Server2")
+# -addonDownloadDir X downloads into X/addons, so X is the folder that holds
+# server 1's addons folder. SERVER2_ADDON_DOWNLOAD_DIR overrides it.
+ADDON_DOWNLOAD_DIR = _cfg.get("SERVER2_ADDON_DOWNLOAD_DIR", "").strip() or (
+    os.path.dirname(WORKSHOP_DIR.rstrip("/\\"))
+    if os.path.basename(WORKSHOP_DIR.rstrip("/\\")).lower() == "addons" else "")
+if not ADDON_DOWNLOAD_DIR:
+    print("[panel] WARNING: WORKSHOP_DIR doesn't end in an 'addons' folder, so server 2 can't be pointed "
+          "at server 1's mods; set SERVER2_ADDON_DOWNLOAD_DIR in config.env.", flush=True)
 
 class Server:
-    def __init__(self, num, config):
+    def __init__(self, num, config, profile_root=None):
         self.num = num
         self.label = f"Server {num}"
         self.config = config
-        self.profile_dir = PROFILE_DIR
-        self.log_dir = LOG_DIR
+        # With a profile root of its own the server gets -profile, and its
+        # profile and logs folders live inside that root.
+        self.profile_root = profile_root
+        self.profile_dir = os.path.join(profile_root, "profile") if profile_root else PROFILE_DIR
+        self.log_dir = os.path.join(profile_root, "logs") if profile_root else LOG_DIR
+        self.extra_args = ["-profile", profile_root] if profile_root else []
+        if profile_root and ADDON_DOWNLOAD_DIR:
+            self.extra_args += ["-addonDownloadDir", ADDON_DOWNLOAD_DIR]
         # Its psutil.Process is kept between calls: cpu_percent() measures
         # usage since the previous call on the same object.
         self.proc = None
@@ -135,7 +160,7 @@ class Server:
         self.monitor_state_file = os.path.join(
             _BASE_DIR, ".monitor-state.json" if num == 1 else f".monitor-state-{num}.json")
 
-SERVERS = {1: Server(1, SERVER_CONFIG), 2: Server(2, SERVER2_CONFIG)}
+SERVERS = {1: Server(1, SERVER_CONFIG), 2: Server(2, SERVER2_CONFIG, SERVER2_PROFILE)}
 _current_server = contextvars.ContextVar("current_server", default=SERVERS[1])
 
 def srv():
@@ -152,7 +177,7 @@ def build_server_args(load_save=True):
     The 'enabled' toggle in the UI controls only the `persistence` block in
     config.json (autosave). `-logStats` makes the server log its FPS every
     second; the panel's FPS graph reads it from console.log."""
-    args = ["-config", srv().config]
+    args = ["-config", srv().config] + srv().extra_args
     if load_save:
         args.append("-loadSessionSave")
     if MAX_FPS:
@@ -1174,6 +1199,7 @@ def api_status():
     return jsonify({
         "server":         srv().num,
         "servers":        [{"num": x.num, "label": x.label, "config": x.config,
+                            "profile": x.profile_root or os.path.dirname(x.profile_dir),
                             "config_exists": os.path.exists(x.config),
                             "running": get_server_pid(x) is not None} for x in SERVERS.values()],
         "running":        pid is not None,
