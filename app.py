@@ -24,6 +24,7 @@ import threading
 import time
 import glob
 import calendar
+import contextvars
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -99,6 +100,51 @@ SHUTDOWN_TIMEOUT = int(_cfg.get("SHUTDOWN_TIMEOUT", 180))
 # Small helper that delivers Ctrl+C to the server's console on Windows.
 _CTRL_C_HELPER = os.path.join(_BASE_DIR, "win_ctrl_c.py")
 
+# ─── SERVERS ──────────────────────────────────────────────────────────────────
+#
+# The panel runs two server instances from the same installation. Server 2
+# differs only in its config file: config2.json next to config.json, or
+# SERVER2_CONFIG in config.env. Both share the profile folder, so their logs
+# land in the same folder and are told apart by the "-config" path each log
+# records at startup; running servers are told apart by their command line.
+# Each request names its server in an X-Server header (the pages add it), and
+# srv() returns that server; the monitor and lifecycle threads set it too.
+
+SERVER2_CONFIG = _cfg.get("SERVER2_CONFIG", os.path.join(os.path.dirname(SERVER_CONFIG), "config2.json"))
+
+class Server:
+    def __init__(self, num, config):
+        self.num = num
+        self.label = f"Server {num}"
+        self.config = config
+        self.profile_dir = PROFILE_DIR
+        self.log_dir = LOG_DIR
+        # Its psutil.Process is kept between calls: cpu_percent() measures
+        # usage since the previous call on the same object.
+        self.proc = None
+        # When the panel last launched it and why, so the monitor can tell
+        # panel starts from ones that happened outside it.
+        self.last_launch = {"ts": 0.0, "action": None}
+        self.lifecycle = {"action": None, "phase": None, "last": None}
+        self.lifecycle_lock = threading.Lock()
+        # Log follower state (persisted). midnight: epoch of 00:00 on the day
+        # the log began; days: midnights passed since; last_sod: last line's
+        # second-of-day.
+        self.mon = {"path": None, "offset": 0, "midnight": 0.0, "days": 0, "last_sod": 0.0, "joined": {}}
+        self.mon_rt = {"pid": None, "fps": None, "fps_at": None}
+        self.monitor_state_file = os.path.join(
+            _BASE_DIR, ".monitor-state.json" if num == 1 else f".monitor-state-{num}.json")
+
+SERVERS = {1: Server(1, SERVER_CONFIG), 2: Server(2, SERVER2_CONFIG)}
+_current_server = contextvars.ContextVar("current_server", default=SERVERS[1])
+
+def srv():
+    """The server the current request, monitor step or lifecycle run is about."""
+    return _current_server.get()
+
+def other_server(server=None):
+    return SERVERS[2 if (server or srv()).num == 1 else 1]
+
 def build_server_args(load_save=True):
     """Build the launch arguments. `-loadSessionSave` is passed on every launch
     except a hard restart: with no save files it's a no-op, and including it
@@ -106,7 +152,7 @@ def build_server_args(load_save=True):
     The 'enabled' toggle in the UI controls only the `persistence` block in
     config.json (autosave). `-logStats` makes the server log its FPS every
     second; the panel's FPS graph reads it from console.log."""
-    args = ["-config", SERVER_CONFIG]
+    args = ["-config", srv().config]
     if load_save:
         args.append("-loadSessionSave")
     if MAX_FPS:
@@ -651,10 +697,6 @@ def all_scenarios_cached():
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-# The server's psutil.Process is kept between calls: cpu_percent() measures
-# usage since the previous call on the same object.
-_server_proc = None
-
 def _is_server_process(p):
     # Linux truncates process names to 15 chars, so also look at argv[0].
     if (p.info.get("name") or "").startswith("ArmaReforgerSer"):
@@ -662,27 +704,46 @@ def _is_server_process(p):
     cmd = p.info.get("cmdline") or []
     return bool(cmd) and os.path.basename(cmd[0]).startswith("ArmaReforgerServer")
 
-def get_server_process():
-    global _server_proc
-    p = _server_proc
+def _config_arg(cmdline):
+    """The -config path in a command line, or None."""
+    for i, a in enumerate(cmdline):
+        if a.lower() == "-config" and i + 1 < len(cmdline):
+            return cmdline[i + 1]
+        if a.lower().startswith("-config="):
+            return a.split("=", 1)[1]
+    return None
+
+def _is_config_of(path, server):
+    """Whether a -config path (from a command line or a log) is `server`'s."""
+    if not path:
+        return server.num == 1  # started without -config: count it as server 1
+    path = path.strip().strip('"')
+    if os.path.isabs(path):
+        return os.path.normcase(os.path.normpath(path)) == os.path.normcase(os.path.normpath(server.config))
+    return os.path.basename(path).lower() == os.path.basename(server.config).lower()
+
+def get_server_process(server=None):
+    s = server or srv()
+    p = s.proc
     if p is not None:
         try:
             if p.is_running() and p.status() != psutil.STATUS_ZOMBIE:
                 return p
         except psutil.Error:
             pass
-        _server_proc = None
+        s.proc = None
     for p in psutil.process_iter(["name", "cmdline"]):
         try:
-            if _is_server_process(p) and p.status() != psutil.STATUS_ZOMBIE:
-                _server_proc = p
+            if (_is_server_process(p) and p.status() != psutil.STATUS_ZOMBIE
+                    and _is_config_of(_config_arg(p.info.get("cmdline") or []), s)):
+                s.proc = p
                 return p
         except psutil.Error:
             continue
     return None
 
-def get_server_pid():
-    p = get_server_process()
+def get_server_pid(server=None):
+    p = get_server_process(server)
     return p.pid if p else None
 
 def get_process_uptime(proc):
@@ -726,13 +787,26 @@ def tail_lines(path, n):
             data = f.read(step) + data
     return data.decode("utf-8", errors="replace").splitlines()[-n:]
 
-# When the panel last launched the server and why, so the monitor can tell
-# panel starts from ones that happened outside it.
-_last_launch = {"ts": 0.0, "action": None}
+def _config_ports(cfg):
+    ports = {cfg.get("bindPort") or 2001, cfg.get("publicPort"),
+             (cfg.get("a2s") or {}).get("port"), (cfg.get("rcon") or {}).get("port")}
+    return {p for p in ports if isinstance(p, int) and p > 0}
+
+def _check_can_launch():
+    s, other = srv(), other_server()
+    if not os.path.exists(s.config):
+        raise RuntimeError(f"{os.path.basename(s.config)} doesn't exist yet. Create it on the Config file page.")
+    if get_server_process(other) is not None:
+        clash = _config_ports(read_config()) & _config_ports(read_config(other))
+        if clash:
+            raise RuntimeError(
+                f"{s.label} would use port{'s' if len(clash) > 1 else ''} {', '.join(map(str, sorted(clash)))}, which {other.label} "
+                f"(running) also uses. Give {os.path.basename(s.config)} its own ports.")
 
 def launch_server(load_save=True):
+    _check_can_launch()
     apply_selected_modlist()
-    _last_launch.update(ts=time.time(), action=_LIFECYCLE["action"] or "start")
+    srv().last_launch.update(ts=time.time(), action=srv().lifecycle["action"] or "start")
     args = [SERVER_BINARY] + build_server_args(load_save)
     if IS_WINDOWS:
         # Give the server its own console, as if started by hand, so the panel
@@ -757,31 +831,55 @@ def request_shutdown(proc):
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or f"Ctrl+C helper exited with code {r.returncode}")
 
-def get_latest_log():
+_log_config_cache = {}  # log folder -> the -config path its console.log records
+
+def _log_config(folder):
+    """The -config path a log was started with ("" for none), or None while
+    its CLI Params line hasn't been written yet."""
+    if folder in _log_config_cache:
+        return _log_config_cache[folder]
     try:
-        dirs = sorted(glob.glob(f"{LOG_DIR}/logs_*"), reverse=True)
-        if not dirs:
-            return None
-        path = os.path.join(dirs[0], "console.log")
-        return path if os.path.exists(path) else None
+        with open(os.path.join(folder, "console.log"), encoding="utf-8", errors="replace") as f:
+            head = f.read(65536)
+    except OSError:
+        return None
+    m = re.search(r"CLI Params:(.*)", head)
+    if not m:
+        return None
+    a = re.search(r"-config\s+(.+?)(?=\s+-[A-Za-z]|\s*$)", m.group(1).strip())
+    _log_config_cache[folder] = a.group(1) if a else ""
+    return _log_config_cache[folder]
+
+def get_latest_log(server=None):
+    """The newest console.log written by `server` (logs of both servers share
+    a folder; each log names its config file on its CLI Params line)."""
+    s = server or srv()
+    try:
+        dirs = sorted(glob.glob(os.path.join(s.log_dir, "logs_*")), reverse=True)
     except Exception:
         return None
+    for d in dirs[:30]:
+        path = os.path.join(d, "console.log")
+        cfg = _log_config(d) if os.path.exists(path) else None
+        if cfg is not None and _is_config_of(cfg, s):
+            return path
+    return None
 
-def read_config():
+def read_config(server=None):
     try:
-        with open(SERVER_CONFIG, encoding="utf-8") as f:
+        with open((server or srv()).config, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
 def write_config(cfg):
-    with open(SERVER_CONFIG, "w", encoding="utf-8") as f:
+    with open(srv().config, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent="\t")
 
-def read_config_strict():
+def read_config_strict(server=None):
     """Like read_config(), but raises instead of returning {} on a missing or
     broken file, for callers that write the result back."""
-    with open(SERVER_CONFIG, encoding="utf-8") as f:
+    with open((server or srv()).config, encoding="utf-8") as f:
         return json.load(f)
 
 # ─── PERSISTENCE ─────────────────────────────────────────────────────────────
@@ -823,10 +921,10 @@ _FLUSHABLE_SUBDIRS = ("game", "playersave")
 
 def _save_root():
     for sub in _SAVE_SUBDIRS:
-        p = os.path.join(PROFILE_DIR, sub)
+        p = os.path.join(srv().profile_dir, sub)
         if os.path.isdir(p):
             return p
-    return os.path.join(PROFILE_DIR, ".save")  # canonical Linux dedicated path
+    return os.path.join(srv().profile_dir, ".save")  # canonical Linux dedicated path
 
 def _scan_dir(path):
     """Return {count, bytes, newest} for files under `path`, or zeros if absent."""
@@ -919,7 +1017,7 @@ def _archive_scenario_save(scenario_id):
     folders = _scenario_save_folders(scenario_id)
     if not folders:
         return 0, None, []
-    archive = os.path.join(PROFILE_DIR, "save-archive", time.strftime("%Y-%m-%d_%H-%M-%S"))
+    archive = os.path.join(srv().profile_dir, "save-archive", time.strftime("%Y-%m-%d_%H-%M-%S"))
     while os.path.exists(archive):
         archive += "_"
     os.makedirs(os.path.join(archive, "game"))
@@ -1009,6 +1107,11 @@ def index():
     with open(os.path.join(_BASE_DIR, "index.html"), encoding="utf-8") as f:
         return f.read()
 
+@app.before_request
+def _select_server():
+    n = request.headers.get("X-Server") or request.args.get("server") or "1"
+    _current_server.set(SERVERS.get(int(n) if n.isdigit() else 1, SERVERS[1]))
+
 @app.route("/mods")
 def mods_page():
     if not session.get("logged_in"):
@@ -1069,9 +1172,13 @@ def api_status():
     ram_used, ram_total = get_system_ram()
     missions = all_scenarios_cached()
     return jsonify({
+        "server":         srv().num,
+        "servers":        [{"num": x.num, "label": x.label, "config": x.config,
+                            "config_exists": os.path.exists(x.config),
+                            "running": get_server_pid(x) is not None} for x in SERVERS.values()],
         "running":        pid is not None,
         "pid":            pid,
-        "lifecycle":      dict(_LIFECYCLE),
+        "lifecycle":      dict(srv().lifecycle),
         "map":            get_map_name(cfg),
         "players":        0,
         "uptime":         format_uptime(uptime) if proc else "—",
@@ -1120,7 +1227,7 @@ def api_metrics():
         "ram_used": ram_used, "ram_total": ram_total,
         "running": proc is not None, "ts": int(time.time()),
         "fps": current_fps(),
-        "net_up": _mon_runtime["net_up"], "net_down": _mon_runtime["net_down"],
+        "net_up": _net["up"], "net_down": _net["down"],
     })
 
 @app.route("/api/logs")
@@ -1206,18 +1313,28 @@ def _insert_mods(new_game, old_game, mods):
 def api_config_file_get():
     if not session.get("logged_in"):
         return jsonify({"error": "unauthorized"}), 401
+    if not os.path.exists(srv().config):
+        # A new server: offer the other server's config as a starting point.
+        try:
+            text = json.dumps(_config_without_mods(read_config_strict(other_server())), indent="\t", ensure_ascii=False)
+        except (OSError, ValueError):
+            text = "{\n\t\"game\": {}\n}"
+        return jsonify({"ok": True, "text": text, "version": None, "path": srv().config,
+                        "warning": f"{os.path.basename(srv().config)} doesn't exist yet. Below is "
+                                   f"{other_server().label}'s config as a starting point: give it its own "
+                                   f"name and ports (bindPort, publicPort, a2s, rcon), then Save to create it."})
     try:
         cfg = read_config_strict()
     except (OSError, ValueError) as e:
         # Show the raw text so a broken file can be repaired from here.
         try:
-            with open(SERVER_CONFIG, encoding="utf-8") as f:
+            with open(srv().config, encoding="utf-8") as f:
                 raw = f.read()
         except OSError:
             raw = ""
-        return jsonify({"ok": True, "text": raw, "version": None, "path": SERVER_CONFIG,
+        return jsonify({"ok": True, "text": raw, "version": None, "path": srv().config,
                         "warning": f"config.json can't be read as JSON ({e}); it is shown as-is."})
-    return jsonify({"ok": True, "path": SERVER_CONFIG, "version": _config_version(cfg),
+    return jsonify({"ok": True, "path": srv().config, "version": _config_version(cfg),
                     "text": json.dumps(_config_without_mods(cfg), indent="\t", ensure_ascii=False)})
 
 @app.route("/api/config-file", methods=["POST"])
@@ -1250,8 +1367,8 @@ def api_config_file_save():
     # written in at the next launch anyway.
     new["game"] = _insert_mods(new["game"], old_game, old_game.get("mods", []))
     try:
-        if os.path.exists(SERVER_CONFIG):
-            shutil.copy2(SERVER_CONFIG, SERVER_CONFIG + ".bak")
+        if os.path.exists(srv().config):
+            shutil.copy2(srv().config, srv().config + ".bak")
         write_config(new)
     except OSError as e:
         return jsonify({"ok": False, "error": str(e)})
@@ -1270,7 +1387,7 @@ def api_persistence_get():
         "autoSaveInterval": block.get("autoSaveInterval", 10),
         "hiveId":           block.get("hiveId", 1),
         "saves":            saves,
-        "profile_dir":      PROFILE_DIR,
+        "profile_dir":      srv().profile_dir,
     })
 
 @app.route("/api/persistence", methods=["POST"])
@@ -1327,6 +1444,9 @@ def api_persistence_flush():
     # handles and may rewrite them mid-flush, which leaves us with partials.
     if get_server_pid():
         return jsonify({"ok": False, "error": "Stop the server before flushing saves"})
+    other = other_server()
+    if other.profile_dir == srv().profile_dir and get_server_pid(other):
+        return jsonify({"ok": False, "error": f"{other.label} is running and shares this save folder; stop it first"})
     try:
         removed = _flush_saves()
         return jsonify({"ok": True, "removed": removed, "saves": _scan_saves()})
@@ -1406,25 +1526,35 @@ def save_modlist(name, mods):
         f.write("\n")
     os.replace(tmp, _modlist_path(name))
 
-def get_selected_modlist():
+def _read_state():
     try:
         with open(_STATE_FILE, encoding="utf-8") as f:
-            name = json.load(f).get("selected_modlist")
-    except (OSError, ValueError, AttributeError):
-        return None
+            state = json.load(f)
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def _selected_key(server):
+    # Server 1 keeps the original key so existing installs carry over.
+    return "selected_modlist" if server.num == 1 else f"selected_modlist_{server.num}"
+
+def get_selected_modlist(server=None):
+    name = _read_state().get(_selected_key(server or srv()))
     return name if isinstance(name, str) and _find_modlist(name) == name else None
 
-def set_selected_modlist(name):
+def set_selected_modlist(name, server=None):
+    state = _read_state()
+    state[_selected_key(server or srv())] = name
     with open(_STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"selected_modlist": name}, f)
+        json.dump(state, f)
 
 def ensure_modlists():
     """First run: turn the mods currently in config.json into a "default" list."""
     with _MODLIST_LOCK:
         if os.path.isdir(MODLISTS_DIR):
             return
-        save_modlist("default", read_config().get("game", {}).get("mods", []))
-        set_selected_modlist("default")
+        save_modlist("default", read_config(SERVERS[1]).get("game", {}).get("mods", []))
+        set_selected_modlist("default", SERVERS[1])
 
 def apply_selected_modlist():
     """Write the selected mod list into config.json's game.mods. Called right
@@ -1523,8 +1653,11 @@ def api_modlists_delete():
         try:
             os.remove(_modlist_path(name))
             remaining = list_modlists()
-            if was_selected:
-                set_selected_modlist(remaining[0] if remaining else None)
+            for server in SERVERS.values():
+                # get_selected_modlist() ignores lists that no longer exist, so
+                # read the raw state to find who had this one selected.
+                if _read_state().get(_selected_key(server)) == name:
+                    set_selected_modlist(remaining[0] if remaining else None, server)
         except OSError as e:
             return jsonify({"ok": False, "error": str(e)})
     return _modlists_response(restart_required=was_selected and get_server_pid() is not None)
@@ -1535,8 +1668,8 @@ def api_start():
         return jsonify({"error": "unauthorized"}), 401
     err = _csrf_required()
     if err: return err
-    if _LIFECYCLE["action"]:
-        return jsonify({"ok": False, "error": f"A {_LIFECYCLE['action']} is already in progress"})
+    if srv().lifecycle["action"]:
+        return jsonify({"ok": False, "error": f"A {srv().lifecycle['action']} is already in progress"})
     if get_server_pid():
         return jsonify({"ok": False, "error": "Server is already running"})
     try:
@@ -1560,22 +1693,21 @@ def api_start():
 #                 launch always passes -loadSessionSave, so it resumes from
 #                 that save
 
-_LIFECYCLE_LOCK = threading.Lock()
-_LIFECYCLE = {"action": None, "phase": None, "last": None}
-
 def _wait_for_exit(proc, what):
     try:
         proc.wait(SHUTDOWN_TIMEOUT)
     except psutil.TimeoutExpired:
         raise RuntimeError(f"Server did not {what} within {SHUTDOWN_TIMEOUT}s and was left running")
 
-def _run_lifecycle(action, proc):
+def _run_lifecycle(action, proc, server):
+    _current_server.set(server)  # this runs in its own thread
+    lc = server.lifecycle
     error = None
     archived = None
     try:
         try:
             if proc is not None and action == "hard-restart":
-                _LIFECYCLE["phase"] = "stopping"
+                lc["phase"] = "stopping"
                 proc.terminate()  # SIGTERM on Linux, an immediate kill on Windows
                 try:
                     proc.wait(SHUTDOWN_TIMEOUT)
@@ -1583,7 +1715,7 @@ def _run_lifecycle(action, proc):
                     proc.kill()
                     proc.wait(10)
             elif proc is not None:
-                _LIFECYCLE["phase"] = "saving"
+                lc["phase"] = "saving"
                 request_shutdown(proc)
                 _wait_for_exit(proc, "save and exit")
         except psutil.NoSuchProcess:
@@ -1591,35 +1723,44 @@ def _run_lifecycle(action, proc):
         if action == "hard-restart":
             # The scenario about to be launched is the one that starts fresh.
             scenario = read_config().get("game", {}).get("scenarioId", "")
-            _LIFECYCLE["phase"] = "archiving"
+            lc["phase"] = "archiving"
             count, path, folders = _archive_scenario_save(scenario)
             archived = {"count": count, "path": path, "folders": folders,
                         "scenario": scenario, "save_root": _save_root()}
         if action != "stop":
-            _LIFECYCLE["phase"] = "starting"
+            lc["phase"] = "starting"
             launch_server(load_save=action != "hard-restart")
             time.sleep(1)  # let the new process show up before reporting done
     except Exception as e:
         error = str(e)
-    _LIFECYCLE["last"] = {"action": action, "ok": error is None, "error": error,
+    lc["last"] = {"action": action, "ok": error is None, "error": error,
                           "archived": archived, "ts": int(time.time())}
-    _LIFECYCLE["phase"] = None
-    _LIFECYCLE["action"] = None
+    lc["phase"] = None
+    lc["action"] = None
 
 def _begin_lifecycle(action, require_running):
     if not session.get("logged_in"):
         return jsonify({"error": "unauthorized"}), 401
     err = _csrf_required()
     if err: return err
+    s, other = srv(), other_server()
     proc = get_server_process()
     if require_running and proc is None:
         return jsonify({"ok": False, "error": "Server is not running"})
-    with _LIFECYCLE_LOCK:
-        if _LIFECYCLE["action"]:
-            return jsonify({"ok": False, "error": f"A {_LIFECYCLE['action']} is already in progress"})
-        _LIFECYCLE["action"] = action
-        _LIFECYCLE["phase"] = None
-    threading.Thread(target=_run_lifecycle, args=(action, proc), daemon=True).start()
+    if action != "stop" and not os.path.exists(s.config):
+        return jsonify({"ok": False, "error": f"{os.path.basename(s.config)} doesn't exist yet. Create it on the Config file page."})
+    if action == "hard-restart" and other.profile_dir == s.profile_dir and get_server_pid(other):
+        # Both servers keep their sessions in the same save folder.
+        scenario = read_config().get("game", {}).get("scenarioId")
+        if scenario and scenario == read_config(other).get("game", {}).get("scenarioId"):
+            return jsonify({"ok": False, "error": f"{other.label} is running the same scenario from the same "
+                                                  f"save folder; a hard restart would move its save too"})
+    with s.lifecycle_lock:
+        if s.lifecycle["action"]:
+            return jsonify({"ok": False, "error": f"A {s.lifecycle['action']} is already in progress"})
+        s.lifecycle["action"] = action
+        s.lifecycle["phase"] = None
+    threading.Thread(target=_run_lifecycle, args=(action, proc, s), daemon=True).start()
     return jsonify({"ok": True, "pending": True, "persistence": _persistence_enabled()})
 
 @app.route("/api/stop", methods=["POST"])
@@ -1636,17 +1777,17 @@ def api_soft_restart():
 
 # ─── MONITORING ──────────────────────────────────────────────────────────────
 #
-# A background thread runs every couple of seconds and
-#   - follows the newest console.log for players joining and leaving,
-#   - notices the server process starting and stopping,
-#   - measures network throughput (whole machine, loopback excluded).
-# Timeline entries are appended to events.jsonl. Where it is in the log is kept
-# in .monitor-state.json so a panel restart picks up where it left off, and
-# lines written while the panel was down are still turned into entries.
+# A background thread runs every couple of seconds and, for each server,
+#   - follows its newest console.log for players joining and leaving,
+#   - notices its process starting and stopping,
+# and measures network throughput (whole machine, loopback excluded).
+# Timeline entries are appended to events.jsonl, tagged with the server.
+# Where each server's follower is in its log is kept in .monitor-state.json
+# (server 2: .monitor-state-2.json) so a panel restart picks up where it left
+# off, and lines written while the panel was down still become entries.
 # Current server stats come from the Server Admin Tools mod's stats file.
 
 EVENTS_FILE         = os.path.join(_BASE_DIR, "events.jsonl")
-_MONITOR_STATE_FILE = os.path.join(_BASE_DIR, ".monitor-state.json")
 _MONITOR_INTERVAL   = 2.0
 _STATS_FILE_NAME    = "serveradmintools_stats.json"
 
@@ -1664,45 +1805,48 @@ _FPS_MAX_AGE = 10
 _EVENTS_LOCK = threading.Lock()
 _monitor_started = False
 _monitor_start_lock = threading.Lock()
-# Log follower state (persisted). midnight: epoch of 00:00 on the day the log
-# began; days: midnights passed since; last_sod: last line's second-of-day.
-_mon = {"path": None, "offset": 0, "midnight": 0.0, "days": 0, "last_sod": 0.0, "joined": {}}
-_mon_runtime = {"pid": None, "net": None, "net_at": 0.0, "net_up": None, "net_down": None,
-                "fps": None, "fps_at": None}
+_net = {"totals": None, "at": 0.0, "up": None, "down": None}  # machine-wide
 
 _ACTION_LABELS = {"start": "Start", "stop": "Stop", "soft-restart": "Soft restart", "hard-restart": "Hard restart",
                   "hard-reset": "Hard reset"}  # older timeline entries
 
 def record_event(kind, ts=None, **fields):
-    entry = {"ts": round(ts if ts is not None else time.time(), 3), "type": kind, **fields}
+    entry = {"ts": round(ts if ts is not None else time.time(), 3), "type": kind, "server": srv().num, **fields}
     with _EVENTS_LOCK, open(EVENTS_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-def read_events(limit):
+def read_events(limit, server=None):
+    """The newest `limit` entries of `server` (entries from before the panel
+    ran two servers have no server field and belong to server 1)."""
+    num = (server or srv()).num
     if not os.path.exists(EVENTS_FILE):
         return []
     events = []
-    for line in tail_lines(EVENTS_FILE, limit):
+    for line in tail_lines(EVENTS_FILE, min(limit * 5, 20000)):
         try:
-            events.append(json.loads(line))
+            e = json.loads(line)
         except ValueError:
             continue
+        if e.get("server", 1) == num:
+            events.append(e)
     events.sort(key=lambda e: e.get("ts", 0), reverse=True)
-    return events
+    return events[:limit]
 
-def _stats_path():
-    configured = _cfg.get("STATS_FILE", "").strip()
+def _stats_path(server=None):
+    s = server or srv()
+    configured = (_cfg.get(f"SERVER{s.num}_STATS_FILE", "") if s.num > 1 else "").strip() \
+        or _cfg.get("STATS_FILE", "").strip()
     if configured:
         return configured
     # Match the name case-insensitively: the mod may capitalise it, and Linux
     # file names are case-sensitive.
     try:
-        for fn in os.listdir(PROFILE_DIR):
+        for fn in os.listdir(s.profile_dir):
             if fn.lower() == _STATS_FILE_NAME:
-                return os.path.join(PROFILE_DIR, fn)
+                return os.path.join(s.profile_dir, fn)
     except OSError:
         pass
-    return os.path.join(PROFILE_DIR, _STATS_FILE_NAME)
+    return os.path.join(s.profile_dir, _STATS_FILE_NAME)
 
 def read_server_stats():
     """Returns (stats dict or None, path, error or None)."""
@@ -1721,11 +1865,12 @@ def read_server_stats():
 
 def current_fps():
     """The server's own FPS from its latest -logStats line, if that is recent."""
-    if _mon_runtime["fps_at"] is None or get_server_pid() is None:
+    rt = srv().mon_rt
+    if rt["fps_at"] is None or get_server_pid() is None:
         return None
-    if time.time() - _mon_runtime["fps_at"] > _FPS_MAX_AGE:
+    if time.time() - rt["fps_at"] > _FPS_MAX_AGE:
         return None
-    return _mon_runtime["fps"]
+    return rt["fps"]
 
 def _creation_time(path):
     try:
@@ -1763,7 +1908,7 @@ def _log_day_start(path):
 
 def _switch_log(path):
     midnight, start_sod = _log_day_start(path)
-    _mon.update(path=path, offset=0, midnight=midnight, days=0, last_sod=float(start_sod), joined={})
+    srv().mon.update(path=path, offset=0, midnight=midnight, days=0, last_sod=float(start_sod), joined={})
 
 def _handle_log_line(line, record):
     m = _LOG_TIME_RE.match(line)
@@ -1771,37 +1916,37 @@ def _handle_log_line(line, record):
         return
     h, mi, s, ms = map(int, m.groups())
     sod = h * 3600 + mi * 60 + s + ms / 1000
-    if sod < _mon["last_sod"] - 3600:  # clock went back a lot: past midnight
-        _mon["days"] += 1
-    _mon["last_sod"] = sod
-    ts = _mon["midnight"] + _mon["days"] * 86400 + sod
+    if sod < srv().mon["last_sod"] - 3600:  # clock went back a lot: past midnight
+        srv().mon["days"] += 1
+    srv().mon["last_sod"] = sod
+    ts = srv().mon["midnight"] + srv().mon["days"] * 86400 + sod
     f = _FPS_RE.search(line)
     if f:
         if record:  # not while silently reading an old log on first run
-            _mon_runtime.update(fps=float(f.group(1)), fps_at=time.time())
+            srv().mon_rt.update(fps=float(f.group(1)), fps_at=time.time())
         return
     j = _JOIN_RE.search(line)
     if j:
         name, ident = j.group(2).strip(), j.group(3)
-        if ident not in _mon["joined"] and record:
+        if ident not in srv().mon["joined"] and record:
             record_event("player_joined", ts, name=name, identity=j.group(4))
-        _mon["joined"][ident] = name
+        srv().mon["joined"][ident] = name
         return
     l = _LEAVE_RE.search(line)
     if l:
         # Players who drop while still loading never "joined"; skip those.
-        name = _mon["joined"].pop(l.group(1), None)
+        name = srv().mon["joined"].pop(l.group(1), None)
         if name is not None and record:
             record_event("player_left", ts, name=name)
 
 def _read_log(record):
     """Process complete lines after the saved offset in the current log."""
-    path = _mon["path"]
+    path = srv().mon["path"]
     try:
-        if os.path.getsize(path) < _mon["offset"]:
+        if os.path.getsize(path) < srv().mon["offset"]:
             _switch_log(path)  # file was replaced or truncated
         with open(path, "rb") as f:
-            f.seek(_mon["offset"])
+            f.seek(srv().mon["offset"])
             while True:
                 chunk = f.read(4 * 1024 * 1024)
                 end = chunk.rfind(b"\n")
@@ -1809,24 +1954,30 @@ def _read_log(record):
                     break
                 for line in chunk[:end].decode("utf-8", errors="replace").splitlines():
                     _handle_log_line(line, record)
-                _mon["offset"] += end + 1
-                f.seek(_mon["offset"])
+                srv().mon["offset"] += end + 1
+                f.seek(srv().mon["offset"])
     except OSError:
         pass
 
+def _log_folder_name(path):
+    return os.path.basename(os.path.dirname(path)) if path else ""
+
 def _follow_logs():
-    if _mon["path"] and os.path.exists(_mon["path"]):
+    mon = srv().mon
+    if mon["path"] and os.path.exists(mon["path"]):
         _read_log(record=True)
     latest = get_latest_log()
-    if latest and latest != _mon["path"]:
+    # Only ever move on to a newer log: while a just-started server's log has
+    # no CLI Params line yet, get_latest_log() can still return an older one.
+    if latest and latest != mon["path"] and _log_folder_name(latest) > _log_folder_name(mon["path"]):
         _switch_log(latest)
         _read_log(record=True)
 
 def _recent_panel_action():
-    if _LIFECYCLE["action"]:
-        return _LIFECYCLE["action"]
+    if srv().lifecycle["action"]:
+        return srv().lifecycle["action"]
     # A restart can finish between two monitor ticks; allow a few seconds.
-    last = _LIFECYCLE["last"]
+    last = srv().lifecycle["last"]
     if last and time.time() - last["ts"] < 3 * _MONITOR_INTERVAL:
         return last["action"]
     return None
@@ -1834,8 +1985,8 @@ def _recent_panel_action():
 def _check_process():
     proc = get_server_process()
     pid = proc.pid if proc else None
-    prev = _mon_runtime["pid"]
-    _mon_runtime["pid"] = pid
+    prev = srv().mon_rt["pid"]
+    srv().mon_rt["pid"] = pid
     if pid == prev:
         return
     started = None
@@ -1852,8 +2003,8 @@ def _check_process():
                      detail=f"From the panel ({_ACTION_LABELS.get(action, action)})" if action
                      else "Outside the panel (crashed, or closed on the server)")
     if pid is not None:
-        from_panel = abs(started - _last_launch["ts"]) < 20
-        action = _last_launch["action"]
+        from_panel = abs(started - srv().last_launch["ts"]) < 20
+        action = srv().last_launch["action"]
         record_event("server_started", started,
                      detail=f"From the panel ({_ACTION_LABELS.get(action, action)})" if from_panel
                      else "Outside the panel")
@@ -1870,55 +2021,63 @@ def _net_totals():
 def _sample_network():
     now = time.time()
     totals = _net_totals()
-    prev, prev_at = _mon_runtime["net"], _mon_runtime["net_at"]
-    _mon_runtime.update(net=totals, net_at=now)
+    prev, prev_at = _net["totals"], _net["at"]
+    _net.update(totals=totals, at=now)
     if prev is None or now <= prev_at:
         return
     up, down = totals[0] - prev[0], totals[1] - prev[1]
     if up < 0 or down < 0:  # counters reset (adapter re-enabled)
         return
-    _mon_runtime.update(net_up=up / (now - prev_at), net_down=down / (now - prev_at))
+    _net.update(up=up / (now - prev_at), down=down / (now - prev_at))
 
 def _load_monitor_state():
+    mon = srv().mon
     try:
-        with open(_MONITOR_STATE_FILE, encoding="utf-8") as f:
+        with open(srv().monitor_state_file, encoding="utf-8") as f:
             saved = json.load(f)
         if saved.get("path") and os.path.exists(saved["path"]):
-            _mon.update({k: saved[k] for k in _mon if k in saved})
+            mon.update({k: saved[k] for k in mon if k in saved})
             # Recompute rather than trust the saved value, which may have been
             # worked out with an outdated time zone.
-            _mon["midnight"] = _log_day_start(_mon["path"])[0]
+            mon["midnight"] = _log_day_start(mon["path"])[0]
     except (OSError, ValueError):
         pass
 
 def _save_monitor_state(last_saved):
-    data = json.dumps(_mon, ensure_ascii=False)
+    data = json.dumps(srv().mon, ensure_ascii=False)
     if data != last_saved:
-        with open(_MONITOR_STATE_FILE, "w", encoding="utf-8") as f:
+        with open(srv().monitor_state_file, "w", encoding="utf-8") as f:
             f.write(data)
     return data
 
 def _monitor_loop():
-    _load_monitor_state()
-    if _mon["path"] is None:
-        # First run: read the current log silently, only to learn who is
-        # connected, so joins from before the panel was installed aren't
-        # reported as new.
-        initial = get_latest_log()
-        if initial:
-            _switch_log(initial)
-            _read_log(record=False)
-    # Whatever is running when the panel starts isn't a new start.
-    _mon_runtime["pid"] = get_server_pid()
-    last_saved = None
+    for server in SERVERS.values():
+        _current_server.set(server)
+        _load_monitor_state()
+        if server.mon["path"] is None:
+            # First run: read the current log silently, only to learn who is
+            # connected, so joins from before the panel was installed aren't
+            # reported as new.
+            initial = get_latest_log()
+            if initial:
+                _switch_log(initial)
+                _read_log(record=False)
+        # Whatever is running when the panel starts isn't a new start.
+        server.mon_rt["pid"] = get_server_pid()
+    last_saved = {}
     while True:
         try:
             _sample_network()
-            _follow_logs()
-            _check_process()
-            last_saved = _save_monitor_state(last_saved)
         except Exception as e:
-            print(f"[panel] monitor error: {e}", flush=True)
+            print(f"[panel] monitor error (network): {e}", flush=True)
+        for server in SERVERS.values():
+            _current_server.set(server)
+            try:
+                _follow_logs()
+                _check_process()
+                last_saved[server.num] = _save_monitor_state(last_saved.get(server.num))
+            except Exception as e:
+                print(f"[panel] monitor error ({server.label}): {e}", flush=True)
         time.sleep(_MONITOR_INTERVAL)
 
 def start_monitor():
@@ -1945,8 +2104,13 @@ def api_server_stats():
     if not session.get("logged_in"):
         return jsonify({"error": "unauthorized"}), 401
     stats, path, error = read_server_stats()
+    other = other_server()
+    # Both servers write the same file unless STATS_FILE settings tell them apart.
+    shared = (os.path.normcase(path) == os.path.normcase(_stats_path(other))
+              and get_server_pid() is not None and get_server_pid(other) is not None)
     return jsonify({"ok": stats is not None, "stats": stats, "path": path, "error": error,
-                    "now": time.time(), "running": get_server_pid() is not None})
+                    "now": time.time(), "running": get_server_pid() is not None,
+                    "shared_with": other.label if shared else None})
 
 # ─── INSTALLED MODS ──────────────────────────────────────────────────────────
 #
@@ -2226,7 +2390,9 @@ def api_mods_installed():
         except (OSError, ValueError):
             pass
     return jsonify({"ok": True, "mods": mods, "names": names, "modlists": lists,
-                    "selected": get_selected_modlist(), "workshop_pending": pending,
+                    "selected": get_selected_modlist(),
+                    "selected_by": {x.label: get_selected_modlist(x) for x in SERVERS.values()},
+                    "workshop_pending": pending,
                     "workshop_url": WORKSHOP_URL})
 
 @app.route("/api/mods/workshop-refresh", methods=["POST"])

@@ -49,7 +49,13 @@
     letter-spacing: 0.06em; color: #fff; line-height: 1;
   }
   .header-left h1 span { color: var(--accent); }
-  .header-actions { display: flex; gap: 10px; }
+  .header-actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .server-select {
+    background: var(--surface); border: 1px solid var(--accent); color: var(--accent);
+    font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 13px; letter-spacing: 0.15em;
+    text-transform: uppercase; padding: 7px 10px; cursor: pointer; outline: none;
+  }
+  .server-select option { background: var(--surface); color: var(--text); }
   .btn-head {
     background: transparent; border: 1px solid var(--border); color: var(--muted);
     font-family: 'Barlow Condensed', sans-serif; font-size: 12px; letter-spacing: 0.2em;
@@ -103,23 +109,27 @@
 
   <header>
     <div class="header-left">
-      <div class="tag">&#9632; Server Management Panel</div>
+      <div class="tag" id="server-tag">&#9632; Server Management Panel</div>
       <h1>CONFIG<span>.JSON</span></h1>
     </div>
     <div class="header-actions">
+      <select id="server-select" class="server-select" onchange="switchServer(this.value)" aria-label="Server">
+        <option value="1">Server 1</option>
+        <option value="2">Server 2</option>
+      </select>
       <a class="btn-head" href="/">← Back to panel</a>
       <button class="btn-head" onclick="doLogout()">Logout ↗</button>
     </div>
   </header>
 
   <div class="card">
-    <div class="card-label">Server config file</div>
+    <div class="card-label" id="card-label">Server config file</div>
     <div class="path" id="path">Loading…</div>
     <div class="hint">
       Everything in the file except <code>game.mods</code>: mods are managed in <strong>Mod Lists</strong> on the
       main page and written into the file at every start, so they are left out here and kept as they are when
       you save. Saving keeps the previous version as <code>config.json.bak</code> next to it. Changes take effect
-      the next time the server starts.
+      the next time the server starts. Use the dropdown at the top to switch between the two servers' files.
     </div>
     <textarea id="editor" spellcheck="false" autocomplete="off" autocapitalize="off" aria-label="config.json"></textarea>
     <div class="bar">
@@ -133,6 +143,31 @@
 
 </div>
 <script>
+// ─── Which server this tab shows ─────────────────────────────────────────────
+// Every request names it in an X-Server header, so actions taken in this tab
+// always go to the server it shows, even if another tab switched servers.
+const SERVER = (() => {
+  const fromUrl = new URLSearchParams(location.search).get('server');
+  if (fromUrl === '1' || fromUrl === '2') return fromUrl;
+  try { return localStorage.getItem('server') === '2' ? '2' : '1'; } catch (e) { return '1'; }
+})();
+const _fetch = window.fetch.bind(window);
+window.fetch = (url, opts = {}) => {
+  const headers = new Headers(opts.headers || {});
+  headers.set('X-Server', SERVER);
+  return _fetch(url, { ...opts, headers });
+};
+function switchServer(n) {
+  try { localStorage.setItem('server', n); } catch (e) {}
+  location.search = '?server=' + n;
+}
+document.getElementById('server-select').value = SERVER;
+// Links to the other pages keep this tab's server.
+document.querySelectorAll('a[href="/"], a[href="/mods"], a[href="/config"]').forEach(a => {
+  a.href = a.getAttribute('href') + '?server=' + SERVER;
+});
+document.getElementById('server-tag').textContent = '■ Server Management Panel · Server ' + SERVER;
+
 let CSRF = '';
 let version = null;   // version of the file the editor was loaded from
 let savedText = '';   // editor text as last loaded/saved, to spot unsaved edits
@@ -176,6 +211,7 @@ async function load() {
     if (r.status === 401) { window.location.href = '/login'; return; }
     const d = await r.json();
     document.getElementById('path').textContent = d.path || '';
+    document.getElementById('card-label').textContent = `Server ${SERVER} config file`;
     editor.value = savedText = d.text || '';
     version = d.version;
     checkJson();

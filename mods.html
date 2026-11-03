@@ -189,6 +189,11 @@
 
 </div>
 <script>
+// "Back to panel" returns to the server the panel tab was showing.
+(() => {
+  const n = new URLSearchParams(location.search).get('server');
+  if (n === '1' || n === '2') document.querySelector('a[href="/"]').href = '/?server=' + n;
+})();
 let DATA = null;            // last /api/mods/installed response
 const open = new Set();     // GUIDs whose details are expanded
 let sortKey = 'name', sortDir = 1;
@@ -264,11 +269,17 @@ function currentView() {
   };
 }
 
+// " (selected for Server 1, Server 2)" for the servers that use list n.
+function selectedFor(n) {
+  const by = Object.entries(DATA.selected_by || {}).filter(([, list]) => list === n).map(([label]) => label);
+  return by.length ? ` (selected for ${by.join(', ')})` : '';
+}
+
 function renderFilter() {
   const sel = document.getElementById('list-filter');
   const prev = sel.value;
   sel.innerHTML = '<option value="">Show all installed</option>' + Object.keys(DATA.modlists).map(n =>
-    `<option value="${esc(n)}">${esc(n)}${n === DATA.selected ? ' (selected for server)' : ''}</option>`).join('');
+    `<option value="${esc(n)}">${esc(n)}${selectedFor(n)}</option>`).join('');
   if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
 }
 
@@ -377,7 +388,8 @@ function detailsRow(m, shown) {
       <span class="mono muted">${x.guid}</span>
     </div>`).join('') : `<div class="empty">${document.getElementById('list-filter').value ? 'No mod in this list requires this one.' : 'No installed mod requires this one.'}</div>`;
   const lists = m.modlists.length ? m.modlists.map(n =>
-    `<div class="dep"><span>${esc(n)}</span>${n === DATA.selected ? '<span class="chip active">selected for server</span>' : ''}</div>`).join('')
+    `<div class="dep"><span>${esc(n)}</span>${Object.entries(DATA.selected_by || {}).filter(([, list]) => list === n)
+      .map(([label]) => `<span class="chip active">selected for ${esc(label)}</span>`).join('')}</div>`).join('')
     : '<div class="empty">Not in any mod list.</div>';
   const foot = [`Folder: ${esc(m.path)}`];
   if (m.workshop_error) foot.push(`Workshop data unavailable: ${esc(m.workshop_error)}`);

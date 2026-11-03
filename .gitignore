@@ -11,3 +11,4 @@ modlists/
 events.jsonl
 .monitor-state.json
 .workshop-cache.json
+.monitor-state-*.json

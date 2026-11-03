@@ -109,7 +109,13 @@
   }
   .btn-logout:hover { border-color: var(--accent); color: var(--accent); }
   a.btn-logout { text-decoration: none; display: inline-block; }
-  .header-actions { display: flex; gap: 10px; }
+  .header-actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .server-select {
+    background: var(--surface); border: 1px solid var(--accent); color: var(--accent);
+    font-family: 'Barlow Condensed', sans-serif; font-weight: 700; font-size: 13px; letter-spacing: 0.15em;
+    text-transform: uppercase; padding: 7px 10px; cursor: pointer; outline: none;
+  }
+  .server-select option { background: var(--surface); color: var(--text); }
 
   .card {
     background: var(--surface);
@@ -503,10 +509,14 @@
 
   <header>
     <div class="header-left">
-      <div class="tag">&#9632; Server Management Panel</div>
+      <div class="tag" id="server-tag">&#9632; Server Management Panel</div>
       <h1>ARMA <span>REFORGER</span></h1>
     </div>
     <div class="header-actions">
+      <select id="server-select" class="server-select" onchange="switchServer(this.value)" aria-label="Server">
+        <option value="1">Server 1</option>
+        <option value="2">Server 2</option>
+      </select>
       <a class="btn-logout" href="/mods" title="Installed mods, sizes and dependencies">Mods</a>
       <a class="btn-logout" href="/config" title="View and edit config.json">Config file</a>
       <button class="btn-logout" onclick="doLogout()">Logout ↗</button>
@@ -787,6 +797,31 @@
 </div>
 
 <script>
+// ─── Which server this tab shows ─────────────────────────────────────────────
+// Every request names it in an X-Server header, so actions taken in this tab
+// always go to the server it shows, even if another tab switched servers.
+const SERVER = (() => {
+  const fromUrl = new URLSearchParams(location.search).get('server');
+  if (fromUrl === '1' || fromUrl === '2') return fromUrl;
+  try { return localStorage.getItem('server') === '2' ? '2' : '1'; } catch (e) { return '1'; }
+})();
+const _fetch = window.fetch.bind(window);
+window.fetch = (url, opts = {}) => {
+  const headers = new Headers(opts.headers || {});
+  headers.set('X-Server', SERVER);
+  return _fetch(url, { ...opts, headers });
+};
+function switchServer(n) {
+  try { localStorage.setItem('server', n); } catch (e) {}
+  location.search = '?server=' + n;
+}
+document.getElementById('server-select').value = SERVER;
+// Links to the other pages keep this tab's server.
+document.querySelectorAll('a[href="/"], a[href="/mods"], a[href="/config"]').forEach(a => {
+  a.href = a.getAttribute('href') + '?server=' + SERVER;
+});
+document.getElementById('server-tag').textContent = '■ Server Management Panel · Server ' + SERVER;
+
 // ─── CSRF + fetch helpers ────────────────────────────────────────────────────
 let CSRF = '';
 
@@ -968,7 +1003,9 @@ async function fetchServerStats() {
     const stale = !d.running || (age != null && age > STATS_STALE_AFTER);
     meta.className = 'stats-meta' + (stale ? ' stale' : '');
     meta.textContent = (stale ? (d.running ? '⚠ Not updating — ' : '⚠ Server offline — ') : '')
-      + (age != null ? `updated ${fmtDuration(age)} ago` : 'no update time in file') + ` · ${d.path}`;
+      + (age != null ? `updated ${fmtDuration(age)} ago` : 'no update time in file') + ` · ${d.path}`
+      + (d.shared_with ? ` · ⚠ ${d.shared_with} is running too and writes this same file, so these values may be from either server` : '');
+    if (d.shared_with) meta.className = 'stats-meta stale';
 
     const tiles = [], groups = [];
     for (const [k, v] of Object.entries(s)) {
@@ -1123,7 +1160,18 @@ async function fetchStatus() {
   }
 }
 
+// Server dropdown labels: which server is running, and whether config2.json exists.
+function updateServerOptions(servers) {
+  if (!servers) return;
+  const sel = document.getElementById('server-select');
+  servers.forEach(x => {
+    const opt = [...sel.options].find(o => o.value === String(x.num));
+    if (opt) opt.textContent = `${x.label} · ${!x.config_exists ? 'no config' : x.running ? 'online' : 'offline'}`;
+  });
+}
+
 function updateUI(d) {
+  updateServerOptions(d.servers);
   const dot = document.getElementById('dot');
   const txt = document.getElementById('status-text');
   dot.className = 'dot ' + (d.running ? 'online' : 'offline');
