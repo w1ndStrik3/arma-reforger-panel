@@ -15,6 +15,7 @@ A lightweight, self-hosted web panel for managing your **Arma Reforger dedicated
 - **Linux and Windows** — Runs on Ubuntu (with the installer) or on Windows Server (manual setup)
 - **Real-time monitoring** — Live CPU, RAM, server FPS (from the server's own `-logStats` output) and network (upload/download) charts updated every 3 seconds
 - **Server timeline** — Players joining and leaving (with names) plus server starts and stops, timestamped; recorded in the background to `events.jsonl` even when nobody has the panel open. Joins and leaves come from the console log and from comparing the Server Admin Tools stats file's player list every second, so one source catches what the other misses
+- **Players online** — Who is on each server right now and for how long, plus a player count in the status bar
 - **Current status** — Everything in the Server Admin Tools mod's `serveradmintools_stats.json` (players, FPS, uptime, AI, vehicles, events…), refreshed live
 - **Live log streaming** — Server console logs with colour-coded output (errors, warnings, network events)
 - **Mission selector** — Vanilla scenarios plus any found in installed mods; the selected scenario's resource name (e.g. `{0648CDB32D6B02B3}Missions/SP02_AirSupport.conf`) is shown under the dropdown

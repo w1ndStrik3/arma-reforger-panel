@@ -1213,7 +1213,8 @@ def api_status():
         "pid":            pid,
         "lifecycle":      dict(srv().lifecycle),
         "map":            get_map_name(cfg),
-        "players":        0,
+        "players":        len(srv().mon["present"]) if pid is not None else 0,
+        "max_players":    cfg.get("game", {}).get("maxPlayers"),
         "uptime":         format_uptime(uptime) if proc else "—",
         "uptime_sec":     uptime,
         "server_name":    cfg.get("game", {}).get("name", "—"),
@@ -1996,7 +1997,7 @@ def _player_joined(ident, name, ts, record=True):
     if ident in present:
         present[ident]["name"] = name
         return
-    present[ident] = {"name": name}
+    present[ident] = {"name": name, "since": ts}
     srv().mon_rt["missing"].pop(ident, None)
     if record:
         record_event("player_joined", ts, name=name, identity=ident)
@@ -2038,7 +2039,7 @@ def _sync_stats_players():
         # First snapshot since the panel had no list (first run): take it as
         # the starting point rather than reporting everyone as joining now.
         for ident, name in players.items():
-            _player_joined(ident, name, now, record=False)
+            _player_joined(ident, name, None, record=False)  # join time unknown
         rt["seen_in_stats"].update(players)
         rt["seeded"] = True
         return
@@ -2124,6 +2125,10 @@ def _check_process():
             _player_left(ident, stopped, reason="server stopped")
         srv().mon["joined"] = {}
     if pid is not None:
+        # A freshly started server has nobody on it yet.
+        srv().mon["present"], srv().mon["joined"] = {}, {}
+        srv().mon_rt["missing"].clear()
+        srv().mon_rt["seen_in_stats"].clear()
         from_panel = abs(started - srv().last_launch["ts"]) < 20
         action = srv().last_launch["action"]
         record_event("server_started", started,
@@ -2188,6 +2193,9 @@ def _monitor_loop():
                 _read_log(record=False)
         # Whatever is running when the panel starts isn't a new start.
         server.mon_rt["pid"] = get_server_pid()
+        if server.mon_rt["pid"] is None:
+            # It stopped while the panel was down: nobody is on it any more.
+            server.mon["present"], server.mon["joined"] = {}, {}
     last_saved = {}
     while True:
         try:
@@ -2223,6 +2231,19 @@ def api_events():
         return jsonify({"error": "unauthorized"}), 401
     limit = max(1, min(int(request.args.get("limit", 200)), 2000))
     return jsonify({"ok": True, "events": read_events(limit)})
+
+@app.route("/api/players")
+def api_players():
+    """The players on the server now, as the timeline knows them (from the
+    console log and the stats file's player list)."""
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    running = get_server_pid() is not None
+    players = [{"id": ident, "name": p.get("name", "?"), "since": p.get("since")}
+               for ident, p in list(srv().mon["present"].items())] if running else []
+    players.sort(key=lambda p: (p["since"] is None, p["since"] or 0, p["name"].lower()))
+    return jsonify({"ok": True, "running": running, "now": time.time(), "players": players,
+                    "max_players": read_config().get("game", {}).get("maxPlayers")})
 
 @app.route("/api/server-stats")
 def api_server_stats():

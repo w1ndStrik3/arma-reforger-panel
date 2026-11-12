@@ -291,6 +291,13 @@
 
   .chart-wrap { position: relative; height: 80px; }
 
+  /* Players online */
+  .player-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+  .player-list .empty-note { grid-column: 1 / -1; }
+  .player { background: var(--bg); border: 1px solid var(--border); padding: 8px 12px; min-width: 0; }
+  .player .pname { color: #fff; font-weight: 500; overflow-wrap: anywhere; }
+  .player .pmeta { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+
   /* Current status + timeline */
   .stats-meta { font-size: 11px; color: var(--muted); margin-bottom: 12px; overflow-wrap: anywhere; }
   .stats-meta.stale { color: var(--warn); }
@@ -552,6 +559,11 @@
         <div class="label">Uptime</div>
         <div class="value" id="uptime-display">—</div>
       </div>
+      <div class="divider-v"></div>
+      <div class="stat-item">
+        <div class="label">Players</div>
+        <div class="value" id="players-display">—</div>
+      </div>
     </div>
   </div>
 
@@ -619,6 +631,12 @@
       </div>
       <div class="chart-wrap"><canvas id="chart-net"></canvas></div>
     </div>
+  </div>
+
+  <!-- Players online -->
+  <div class="card" style="animation-delay:0.11s">
+    <div class="card-label" id="players-label">Players Online</div>
+    <div class="player-list" id="player-list"><div class="empty-note">Loading…</div></div>
   </div>
 
   <!-- Current status + timeline -->
@@ -1064,10 +1082,30 @@ async function fetchTimeline() {
   } catch(e) {}
 }
 
+// ─── Players online ──────────────────────────────────────────────────────────
+async function fetchPlayers() {
+  try {
+    const r = await fetch('/api/players');
+    if (r.status === 401) { window.location.href = '/login'; return; }
+    const d = await r.json();
+    document.getElementById('players-label').textContent = d.running
+      ? `Players Online (${d.players.length}${d.max_players ? ' / ' + d.max_players : ''})` : 'Players Online';
+    const el = document.getElementById('player-list');
+    if (!d.running) { el.innerHTML = '<div class="empty-note">Server offline.</div>'; return; }
+    if (!d.players.length) { el.innerHTML = '<div class="empty-note">No players online.</div>'; return; }
+    el.innerHTML = d.players.map(p => `<div class="player" title="${escHtml(p.id)}">
+        <div class="pname">${escHtml(p.name)}</div>
+        <div class="pmeta">${p.since ? `online ${fmtDuration(d.now - p.since)} · since ${new Date(p.since * 1000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}` : 'online since before the panel started tracking'}</div>
+      </div>`).join('');
+  } catch(e) {}
+}
+
 fetchServerStats();
 fetchTimeline();
+fetchPlayers();
 setInterval(fetchServerStats, 5000);
 setInterval(fetchTimeline, 5000);
+setInterval(fetchPlayers, 5000);
 
 // ─── SSE Log stream ───────────────────────────────────────────────────────────
 let evtSource = null;
@@ -1182,6 +1220,8 @@ function updateUI(d) {
   document.getElementById('ip-port-display').textContent = (d.ip && d.port) ? d.ip + ':' + d.port : '—';
   document.getElementById('map-name').textContent = d.map || '—';
   document.getElementById('uptime-display').textContent = d.running ? (d.uptime || '—') : '—';
+  document.getElementById('players-display').textContent = d.running
+    ? `${d.players}${d.max_players ? ' / ' + d.max_players : ''}` : '—';
 
   // A stop/restart still running on the server (e.g. after a page reload)
   // keeps the controls locked until it finishes.
