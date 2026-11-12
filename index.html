@@ -991,28 +991,32 @@ function prettyKey(k) {
   return k.charAt(0).toUpperCase() + k.slice(1);
 }
 
-// The daily soft restart (DAILY_RESTART_TIME in config.env).
+// The daily soft restart (DAILY_RESTART_TIME in config.env), and automatic
+// restarts in progress or failed.
 function updateScheduleNote(d) {
   const el = document.getElementById('sched-note');
   const dr = d.daily_restart, lc = d.lifecycle || {};
-  if (!dr) { el.hidden = true; return; }
-  const zone = dr.tz.split('/').pop().replace(/_/g, ' ');
-  const at = new Date(dr.next * 1000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
-  let text = `Daily soft restart at ${dr.time} ${zone} time` +
-             (at !== dr.time ? ` (${at} your time)` : '') +
-             ` · next in ${fmtDuration(dr.next - Date.now() / 1000).replace(/ \d+s$/, '')}` +
-             (d.running ? '' : ' · skipped while the server is stopped');
+  let text = '';
+  if (dr) {
+    const zone = dr.tz.split('/').pop().replace(/_/g, ' ');
+    const at = new Date(dr.next * 1000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+    text = `Daily soft restart at ${dr.time} ${zone} time` +
+           (at !== dr.time ? ` (${at} your time)` : '') +
+           ` · next in ${fmtDuration(dr.next - Date.now() / 1000).replace(/ \d+s$/, '')}` +
+           (d.running ? '' : ' · skipped while the server is stopped');
+  }
   let error = false;
-  if (lc.action === 'daily-soft-restart') {
-    text = 'Daily soft restart in progress...';
-  } else if (lc.last && lc.last.action === 'daily-soft-restart' && !lc.last.ok
+  const AUTO = { 'daily-soft-restart': 'daily soft restart', 'reboot-start': 'start after the VPS restarted' };
+  if (AUTO[lc.action]) {
+    text = `Automatic ${AUTO[lc.action]} in progress...`;
+  } else if (lc.last && AUTO[lc.last.action] && !lc.last.ok
              && Date.now() / 1000 - lc.last.ts < 86400) {
-    text = `Last daily soft restart failed: ${lc.last.error || 'unknown error'} · ` + text;
+    text = `Automatic ${AUTO[lc.last.action]} failed: ${lc.last.error || 'unknown error'}` + (text ? ' · ' + text : '');
     error = true;
   }
   el.textContent = text;
   el.classList.toggle('error', error);
-  el.hidden = false;
+  el.hidden = !text;
 }
 
 function fmtDuration(sec) {

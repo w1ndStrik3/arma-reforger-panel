@@ -1947,6 +1947,90 @@ def _check_daily_restart():
     for server in SERVERS.values():
         _start_daily_restart(server)
 
+# ─── RELAUNCH AFTER A REBOOT ─────────────────────────────────────────────────
+#
+# The panel keeps, in .panel-state.json under "autostart", the machine's boot
+# time, a heartbeat written every _ALIVE_EVERY seconds, and per server whether
+# it is running. When the panel starts and the boot time has changed, the
+# machine was restarted: every server that was running before is launched
+# again (as with Start, from the session save), once the machine has been up
+# _BOOT_SETTLE seconds so the network is ready. Servers that were stopped stay
+# stopped. A server that stopped outside the panel within _SHUTDOWN_WINDOW
+# seconds of the panel's last heartbeat counts as running: the shutdown closed
+# it (Windows may close the servers just before the panel). A stop from the
+# panel, or a crash well before the restart, counts as stopped.
+
+_ALIVE_EVERY     = 15
+_SHUTDOWN_WINDOW = 60
+_BOOT_SETTLE     = 60
+_BOOT_CHANGED    = 120  # boot times further apart than this mean a reboot
+
+_autostart = {"state": None, "pending": [], "written": 0.0}
+
+def _write_autostart(now=None):
+    st = _autostart["state"]
+    st["alive"] = round(now or time.time(), 3)
+    _update_state("autostart", st)
+    _autostart["written"] = time.time()
+
+def _init_reboot_relaunch():
+    """Runs once when the monitor starts, before it touches the servers'
+    player lists. Returns {server num: last heartbeat} for the servers that
+    were running when the machine went down."""
+    saved = _read_state().get("autostart")
+    saved = saved if isinstance(saved, dict) else {}
+    boot = psutil.boot_time()
+    rebooted = isinstance(saved.get("boot_time"), (int, float)) and abs(boot - saved["boot_time"]) > _BOOT_CHANGED
+    alive = saved.get("alive") if isinstance(saved.get("alive"), (int, float)) else None
+    was_running = {}
+    if rebooted:
+        for num, info in (saved.get("servers") or {}).items():
+            server = SERVERS.get(int(num)) if str(num).isdigit() else None
+            if server is None or not isinstance(info, dict):
+                continue
+            stop = info.get("outside_stop_at")
+            if info.get("running") or (alive and isinstance(stop, (int, float)) and alive - stop <= _SHUTDOWN_WINDOW):
+                was_running[server.num] = alive if info.get("running") else None
+        names = ", ".join(SERVERS[n].label for n in sorted(was_running)) or "none"
+        print(f"[panel] The machine was restarted; servers running before: {names}", flush=True)
+    servers = {}
+    for server in SERVERS.values():
+        running = get_server_pid(server) is not None
+        if server.num in was_running and not running:
+            _autostart["pending"].append(server)
+        # Until it is relaunched, a pending server still counts as wanted.
+        servers[str(server.num)] = {"running": running or server.num in was_running, "outside_stop_at": None}
+    _autostart["state"] = {"boot_time": boot, "alive": None, "servers": servers}
+    _write_autostart()
+    return was_running
+
+def _note_running(server, running, outside_stop_at=None):
+    if _autostart["state"] is None:
+        return
+    _autostart["state"]["servers"][str(server.num)] = {"running": running, "outside_stop_at": outside_stop_at}
+    _write_autostart()
+
+def _reboot_relaunch_tick():
+    if _autostart["state"] is None:
+        return
+    now = time.time()
+    if now - _autostart["written"] >= _ALIVE_EVERY:
+        _write_autostart(now)
+    if not _autostart["pending"] or now - psutil.boot_time() < _BOOT_SETTLE:
+        return
+    pending, _autostart["pending"] = _autostart["pending"], []
+    for server in pending:
+        _current_server.set(server)
+        if get_server_pid(server) is not None:
+            continue  # someone already started it
+        with server.lifecycle_lock:
+            if server.lifecycle["action"]:
+                continue
+            server.lifecycle["action"] = "reboot-start"
+            server.lifecycle["phase"] = None
+        print(f"[panel] Starting {server.label} again after the machine restart", flush=True)
+        threading.Thread(target=_run_lifecycle, args=("reboot-start", None, server), daemon=True).start()
+
 # ─── MONITORING ──────────────────────────────────────────────────────────────
 #
 # A background thread runs every second and, for each server,
@@ -1982,7 +2066,7 @@ _monitor_start_lock = threading.Lock()
 _net = {"totals": None, "at": 0.0, "up": None, "down": None}  # machine-wide
 
 _ACTION_LABELS = {"start": "Start", "stop": "Stop", "soft-restart": "Soft restart", "hard-restart": "Hard restart",
-                  "daily-soft-restart": "Daily soft restart",
+                  "daily-soft-restart": "Daily soft restart", "reboot-start": "Started again after the VPS restarted",
                   "hard-reset": "Hard reset"}  # older timeline entries
 
 def record_event(kind, ts=None, **fields):
@@ -2263,7 +2347,10 @@ def _check_process():
         for ident in list(srv().mon["present"]):
             _player_left(ident, stopped, reason="server stopped")
         srv().mon["joined"] = {}
+        if pid is None:
+            _note_running(srv(), False, None if action else (stopped or time.time()))
     if pid is not None:
+        _note_running(srv(), True)
         # A freshly started server has nobody on it yet.
         srv().mon["present"], srv().mon["joined"] = {}, {}
         srv().mon_rt["missing"].clear()
@@ -2319,6 +2406,11 @@ def _save_monitor_state(last_saved):
     return data
 
 def _monitor_loop():
+    try:
+        was_running = _init_reboot_relaunch()
+    except Exception as e:
+        print(f"[panel] monitor error (reboot check): {e}", flush=True)
+        was_running = {}
     for server in SERVERS.values():
         _current_server.set(server)
         _load_monitor_state()
@@ -2334,6 +2426,12 @@ def _monitor_loop():
         server.mon_rt["pid"] = get_server_pid()
         if server.mon_rt["pid"] is None:
             # It stopped while the panel was down: nobody is on it any more.
+            if was_running.get(server.num):
+                # The panel didn't see it stop: the machine went down with it.
+                down = was_running[server.num]
+                record_event("server_stopped", down, detail="The VPS was shut down or restarted")
+                for ident in list(server.mon["present"]):
+                    _player_left(ident, down, reason="VPS restarted")
             server.mon["present"], server.mon["joined"] = {}, {}
     last_saved = {}
     while True:
@@ -2343,8 +2441,9 @@ def _monitor_loop():
             print(f"[panel] monitor error (network): {e}", flush=True)
         try:
             _check_daily_restart()
+            _reboot_relaunch_tick()
         except Exception as e:
-            print(f"[panel] daily restart error: {e}", flush=True)
+            print(f"[panel] monitor error (schedule): {e}", flush=True)
         for server in SERVERS.values():
             _current_server.set(server)
             try:
