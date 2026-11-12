@@ -1,3 +1,4 @@
 flask
 bcrypt
 psutil
+tzdata; sys_platform == "win32"

@@ -11,6 +11,7 @@ A lightweight, self-hosted web panel for managing your **Arma Reforger dedicated
 - **One-command install** — sets up SteamCMD, downloads the Arma Reforger server and installs the panel automatically
 - **Server control** — Start, stop, soft restart and hard restart your server from the browser
 - **Soft restart** — Save the game state, stop the server and bring it back up from that save
+- **Daily soft restart** — Every running server gets a soft restart at 04:00 Copenhagen time (`DAILY_RESTART_TIME` / `DAILY_RESTART_TZ` in config.env)
 - **Two servers** — Run a second server from the same installation with its own `config2.json`; a dropdown at the top switches the whole panel between Server 1 and Server 2
 - **Linux and Windows** — Runs on Ubuntu (with the installer) or on Windows Server (manual setup)
 - **Real-time monitoring** — Live CPU, RAM, server FPS (from the server's own `-logStats` output) and network (upload/download) charts updated every 3 seconds
@@ -155,6 +156,10 @@ MAX_FPS=60
 
 # Seconds to wait for the server to save and exit on Stop / Soft restart
 SHUTDOWN_TIMEOUT=180
+
+# Daily soft restart of every running server (HH:MM; "off" turns it off)
+DAILY_RESTART_TIME=04:00
+DAILY_RESTART_TZ=Europe/Copenhagen
 
 # Server Admin Tools stats file (defaults to <PROFILE_DIR>/serveradmintools_stats.json)
 # STATS_FILE=

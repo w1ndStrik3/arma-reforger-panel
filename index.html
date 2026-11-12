@@ -212,6 +212,12 @@
     animation: fadeUp 0.4s ease 0.05s both;
   }
 
+  .sched-note {
+    font-size: 12px; color: var(--muted);
+    margin: -4px 0 14px; text-align: center;
+  }
+  .sched-note.error { color: var(--offline); }
+
   .ctrl-btn {
     border: 1px solid var(--border);
     background: var(--surface2);
@@ -584,6 +590,7 @@
       <span class="ctrl-icon">⟳</span>SOFT RESTART
     </button>
   </div>
+  <div class="sched-note" id="sched-note" hidden></div>
 
   <!-- Charts -->
   <div class="charts-row">
@@ -984,6 +991,30 @@ function prettyKey(k) {
   return k.charAt(0).toUpperCase() + k.slice(1);
 }
 
+// The daily soft restart (DAILY_RESTART_TIME in config.env).
+function updateScheduleNote(d) {
+  const el = document.getElementById('sched-note');
+  const dr = d.daily_restart, lc = d.lifecycle || {};
+  if (!dr) { el.hidden = true; return; }
+  const zone = dr.tz.split('/').pop().replace(/_/g, ' ');
+  const at = new Date(dr.next * 1000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+  let text = `Daily soft restart at ${dr.time} ${zone} time` +
+             (at !== dr.time ? ` (${at} your time)` : '') +
+             ` · next in ${fmtDuration(dr.next - Date.now() / 1000).replace(/ \d+s$/, '')}` +
+             (d.running ? '' : ' · skipped while the server is stopped');
+  let error = false;
+  if (lc.action === 'daily-soft-restart') {
+    text = 'Daily soft restart in progress...';
+  } else if (lc.last && lc.last.action === 'daily-soft-restart' && !lc.last.ok
+             && Date.now() / 1000 - lc.last.ts < 86400) {
+    text = `Last daily soft restart failed: ${lc.last.error || 'unknown error'} · ` + text;
+    error = true;
+  }
+  el.textContent = text;
+  el.classList.toggle('error', error);
+  el.hidden = false;
+}
+
 function fmtDuration(sec) {
   sec = Math.max(0, Math.round(sec));
   const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
@@ -1232,6 +1263,8 @@ function updateUI(d) {
     document.getElementById('btn-reset').disabled = lifecycleBusy;
     document.getElementById('btn-soft').disabled  = !d.running || lifecycleBusy;
   }
+
+  updateScheduleNote(d);
 
   const nameInput = document.getElementById('input-name');
   if (document.activeElement !== nameInput) nameInput.value = d.server_name || '';

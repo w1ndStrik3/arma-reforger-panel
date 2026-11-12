@@ -97,6 +97,10 @@ MAX_FPS        = _cfg.get("MAX_FPS", "").strip()
 LOG_STATS_INTERVAL_MS = 1000
 # Seconds to wait for the server to save and exit on stop / soft restart.
 SHUTDOWN_TIMEOUT = int(_cfg.get("SHUTDOWN_TIMEOUT", 180))
+# Every running server gets a soft restart at this time each day ("HH:MM", in
+# DAILY_RESTART_TZ). Blank or "off" turns it off.
+DAILY_RESTART_TIME = _cfg.get("DAILY_RESTART_TIME", "04:00").strip()
+DAILY_RESTART_TZ   = _cfg.get("DAILY_RESTART_TZ", "Europe/Copenhagen").strip() or "Europe/Copenhagen"
 # Small helper that delivers Ctrl+C to the server's console on Windows.
 _CTRL_C_HELPER = os.path.join(_BASE_DIR, "win_ctrl_c.py")
 
@@ -1212,6 +1216,7 @@ def api_status():
         "running":        pid is not None,
         "pid":            pid,
         "lifecycle":      dict(srv().lifecycle),
+        "daily_restart":  daily_restart_info(),
         "map":            get_map_name(cfg),
         "players":        len(srv().mon["present"]) if pid is not None else 0,
         "max_players":    cfg.get("game", {}).get("maxPlayers"),
@@ -1576,11 +1581,17 @@ def get_selected_modlist(server=None):
     name = _read_state().get(_selected_key(server or srv()))
     return name if isinstance(name, str) and _find_modlist(name) == name else None
 
+_STATE_LOCK = threading.Lock()
+
+def _update_state(key, value):
+    with _STATE_LOCK:
+        state = _read_state()
+        state[key] = value
+        with open(_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+
 def set_selected_modlist(name, server=None):
-    state = _read_state()
-    state[_selected_key(server or srv())] = name
-    with open(_STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f)
+    _update_state(_selected_key(server or srv()), name)
 
 def ensure_modlists():
     """First run: turn the mods currently in config.json into a "default" list."""
@@ -1725,7 +1736,8 @@ def api_start():
 #                 other scenarios' saves and player saves stay put
 #   soft-restart  ask the server to save and exit, then start it again; the
 #                 launch always passes -loadSessionSave, so it resumes from
-#                 that save
+#                 that save (daily-soft-restart is the same, started by the
+#                 daily schedule)
 
 def _wait_for_exit(proc, what):
     try:
@@ -1791,7 +1803,8 @@ def _begin_lifecycle(action, require_running):
                                                   f"save folder; a hard restart would move its save too"})
     with s.lifecycle_lock:
         if s.lifecycle["action"]:
-            return jsonify({"ok": False, "error": f"A {s.lifecycle['action']} is already in progress"})
+            label = _ACTION_LABELS.get(s.lifecycle["action"], s.lifecycle["action"]).lower()
+            return jsonify({"ok": False, "error": f"A {label} is already in progress"})
         s.lifecycle["action"] = action
         s.lifecycle["phase"] = None
     threading.Thread(target=_run_lifecycle, args=(action, proc, s), daemon=True).start()
@@ -1808,6 +1821,131 @@ def api_hard_restart():
 @app.route("/api/soft-restart", methods=["POST"])
 def api_soft_restart():
     return _begin_lifecycle("soft-restart", require_running=True)
+
+# ─── DAILY SOFT RESTART ──────────────────────────────────────────────────────
+#
+# At DAILY_RESTART_TIME (in DAILY_RESTART_TZ, Copenhagen time by default) the
+# monitor thread soft-restarts every server that is running: save and exit,
+# then start again from the save, exactly like the Soft restart button. A
+# server that is stopped, or busy with another stop/restart, is left alone.
+# The last restart time handled is kept in .panel-state.json, so restarting
+# the panel right after 04:00 doesn't restart the servers twice; if the panel
+# was down at 04:00 it still catches up within _DAILY_RESTART_GRACE seconds.
+
+_DAILY_RESTART_GRACE = 600
+_daily_restart = {"done": None}  # the scheduled moment last handled (epoch seconds)
+
+def _parse_daily_restart_time(text):
+    if not text or text.lower() in ("off", "no", "false", "0", "none"):
+        return None
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        print(f"[panel] DAILY_RESTART_TIME={text!r} isn't HH:MM; the daily soft restart is off", flush=True)
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+_DAILY_RESTART_HM = _parse_daily_restart_time(DAILY_RESTART_TIME)
+
+# Zones on Central European Time, which the built-in rule below covers when
+# Python has no time zone database (Windows without the tzdata package).
+_CET_ZONES = {"CET", "Europe/Copenhagen", "Europe/Berlin", "Europe/Oslo", "Europe/Stockholm",
+              "Europe/Amsterdam", "Europe/Brussels", "Europe/Paris", "Europe/Madrid", "Europe/Rome",
+              "Europe/Vienna", "Europe/Prague", "Europe/Warsaw", "Europe/Zurich", "Europe/Budapest"}
+
+def _last_sunday_1am_utc(year, month):
+    last = calendar.monthrange(year, month)[1]
+    day = last - (calendar.weekday(year, month, last) + 1) % 7
+    return calendar.timegm((year, month, day, 1, 0, 0))
+
+def _cet_offset(utc_ts):
+    """UTC offset in seconds of Central European Time at `utc_ts`: +1h, or
+    +2h in summer (EU rule: last Sunday of March to last Sunday of October,
+    switching at 01:00 UTC)."""
+    year = time.gmtime(utc_ts).tm_year
+    summer = _last_sunday_1am_utc(year, 3) <= utc_ts < _last_sunday_1am_utc(year, 10)
+    return 7200 if summer else 3600
+
+def _make_daily_restart_clock():
+    """(local_date(ts) -> (y, m, d), to_ts(y, m, d, hh, mm) -> epoch) for DAILY_RESTART_TZ."""
+    import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(DAILY_RESTART_TZ)
+        def local_date(ts):
+            d = datetime.datetime.fromtimestamp(ts, tz)
+            return d.year, d.month, d.day
+        def to_ts(y, mo, d, hh, mm):
+            return datetime.datetime(y, mo, d, hh, mm, tzinfo=tz).timestamp()
+        return local_date, to_ts
+    except Exception:
+        pass
+    if DAILY_RESTART_TZ in _CET_ZONES:
+        def local_date(ts):
+            t = time.gmtime(ts + _cet_offset(ts))
+            return t.tm_year, t.tm_mon, t.tm_mday
+        def to_ts(y, mo, d, hh, mm):
+            naive = calendar.timegm((y, mo, d, hh, mm, 0))
+            return naive - _cet_offset(naive - 3600)
+        return local_date, to_ts
+    print(f"[panel] Unknown time zone {DAILY_RESTART_TZ!r} (on Windows, pip install tzdata); "
+          f"the daily soft restart uses this machine's local time", flush=True)
+    def local_date(ts):
+        t = time.localtime(ts)
+        return t.tm_year, t.tm_mon, t.tm_mday
+    def to_ts(y, mo, d, hh, mm):
+        return time.mktime((y, mo, d, hh, mm, 0, 0, 0, -1))
+    return local_date, to_ts
+
+_daily_clock = _make_daily_restart_clock() if _DAILY_RESTART_HM else None
+
+def _daily_restart_moments(now):
+    """(the last scheduled moment at or before now, the next one after it)."""
+    import datetime
+    local_date, to_ts = _daily_clock
+    y, mo, d = local_date(now)
+    base = datetime.date(y, mo, d)
+    moments = sorted(to_ts(x.year, x.month, x.day, *_DAILY_RESTART_HM)
+                     for x in (base + datetime.timedelta(days=k) for k in (-1, 0, 1)))
+    last = max(t for t in moments if t <= now)
+    return last, min(t for t in moments if t > now)
+
+def daily_restart_info():
+    if not _daily_clock:
+        return None
+    return {"time": "%02d:%02d" % _DAILY_RESTART_HM, "tz": DAILY_RESTART_TZ,
+            "next": int(_daily_restart_moments(time.time())[1])}
+
+def _start_daily_restart(server):
+    _current_server.set(server)
+    proc = get_server_process()
+    if proc is None:
+        return
+    with server.lifecycle_lock:
+        if server.lifecycle["action"]:
+            print(f"[panel] Daily soft restart skipped for {server.label}: "
+                  f"a {server.lifecycle['action']} is in progress", flush=True)
+            return
+        server.lifecycle["action"] = "daily-soft-restart"
+        server.lifecycle["phase"] = None
+    print(f"[panel] Daily soft restart of {server.label}", flush=True)
+    threading.Thread(target=_run_lifecycle, args=("daily-soft-restart", proc, server), daemon=True).start()
+
+def _check_daily_restart():
+    if not _daily_clock:
+        return
+    now = time.time()
+    moment = _daily_restart_moments(now)[0]
+    if _daily_restart["done"] is None:
+        saved = _read_state().get("daily_restart_done")
+        _daily_restart["done"] = saved if isinstance(saved, (int, float)) else 0
+    if moment <= _daily_restart["done"]:
+        return
+    _daily_restart["done"] = moment
+    _update_state("daily_restart_done", moment)
+    if now - moment > _DAILY_RESTART_GRACE:
+        return  # the panel wasn't running at the time
+    for server in SERVERS.values():
+        _start_daily_restart(server)
 
 # ─── MONITORING ──────────────────────────────────────────────────────────────
 #
@@ -1844,6 +1982,7 @@ _monitor_start_lock = threading.Lock()
 _net = {"totals": None, "at": 0.0, "up": None, "down": None}  # machine-wide
 
 _ACTION_LABELS = {"start": "Start", "stop": "Stop", "soft-restart": "Soft restart", "hard-restart": "Hard restart",
+                  "daily-soft-restart": "Daily soft restart",
                   "hard-reset": "Hard reset"}  # older timeline entries
 
 def record_event(kind, ts=None, **fields):
@@ -2202,6 +2341,10 @@ def _monitor_loop():
             _sample_network()
         except Exception as e:
             print(f"[panel] monitor error (network): {e}", flush=True)
+        try:
+            _check_daily_restart()
+        except Exception as e:
+            print(f"[panel] daily restart error: {e}", flush=True)
         for server in SERVERS.values():
             _current_server.set(server)
             try:
