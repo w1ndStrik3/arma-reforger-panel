@@ -155,8 +155,15 @@ class Server:
         # Log follower state (persisted). midnight: epoch of 00:00 on the day
         # the log began; days: midnights passed since; last_sod: last line's
         # second-of-day.
-        self.mon = {"path": None, "offset": 0, "midnight": 0.0, "days": 0, "last_sod": 0.0, "joined": {}}
-        self.mon_rt = {"pid": None, "fps": None, "fps_at": None}
+        # joined: the log's rplIdentity -> {name, id}; present: the players on
+        # the server as the timeline knows them, identityId -> {name}.
+        self.mon = {"path": None, "offset": 0, "midnight": 0.0, "days": 0, "last_sod": 0.0,
+                    "joined": {}, "present": {}}
+        # seen_in_stats: present players the stats file has listed since they
+        # joined; missing: how many snapshots in a row each has been absent
+        # from; left_at: when players last left (see _sync_stats_players).
+        self.mon_rt = {"pid": None, "fps": None, "fps_at": None, "seeded": False,
+                       "seen_in_stats": set(), "missing": {}, "left_at": {}}
         self.monitor_state_file = os.path.join(
             _BASE_DIR, ".monitor-state.json" if num == 1 else f".monitor-state-{num}.json")
 
@@ -1803,8 +1810,10 @@ def api_soft_restart():
 
 # ─── MONITORING ──────────────────────────────────────────────────────────────
 #
-# A background thread runs every couple of seconds and, for each server,
+# A background thread runs every second and, for each server,
 #   - follows its newest console.log for players joining and leaving,
+#   - compares the player list in its Server Admin Tools stats file with the
+#     previous one, for joins and leaves the log doesn't show,
 #   - notices its process starting and stopping,
 # and measures network throughput (whole machine, loopback excluded).
 # Timeline entries are appended to events.jsonl, tagged with the server.
@@ -1814,7 +1823,7 @@ def api_soft_restart():
 # Current server stats come from the Server Admin Tools mod's stats file.
 
 EVENTS_FILE         = os.path.join(_BASE_DIR, "events.jsonl")
-_MONITOR_INTERVAL   = 2.0
+_MONITOR_INTERVAL   = 1.0
 _STATS_FILE_NAME    = "serveradmintools_stats.json"
 
 _LOG_TIME_RE = re.compile(r"^(\d{2}):(\d{2}):(\d{2})\.(\d{3})")
@@ -1953,17 +1962,100 @@ def _handle_log_line(line, record):
         return
     j = _JOIN_RE.search(line)
     if j:
-        name, ident = j.group(2).strip(), j.group(3)
-        if ident not in srv().mon["joined"] and record:
-            record_event("player_joined", ts, name=name, identity=j.group(4))
-        srv().mon["joined"][ident] = name
+        name, rpl, ident = j.group(2).strip(), j.group(3), j.group(4)
+        srv().mon["joined"][rpl] = {"name": name, "id": ident}
+        _player_joined(ident, name, ts, record)
         return
     l = _LEAVE_RE.search(line)
     if l:
         # Players who drop while still loading never "joined"; skip those.
-        name = srv().mon["joined"].pop(l.group(1), None)
-        if name is not None and record:
-            record_event("player_left", ts, name=name)
+        entry = srv().mon["joined"].pop(l.group(1), None)
+        if isinstance(entry, str):  # saved by an older version: name only
+            entry = {"name": entry, "id": next((i for i, p in srv().mon["present"].items()
+                                                if p.get("name") == entry), None)}
+        if entry and entry.get("id"):
+            _player_left(entry["id"], ts, record)
+
+# ─── Who is on the server ────────────────────────────────────────────────────
+# Joins and leaves come from two places: the console log (exact times) and the
+# stats file's player list (catches what the log doesn't say). Both keep the
+# same `present` list, keyed by the player's identity ID, so whichever notices
+# a join or leave first records it and the other then finds nothing to do.
+
+# A player has to be missing from this many stats snapshots in a row before
+# the stats file counts them as gone, so one odd read can't log a leave.
+_STATS_LEAVE_AFTER = 3
+# For this long after a player leaves, the stats file can't log them joining
+# again (it may still list them for a moment); the log still can.
+_STATS_REJOIN_BLOCK = 20
+# Stats not updated for this long (seconds) are ignored.
+_STATS_MAX_AGE = 30
+
+def _player_joined(ident, name, ts, record=True):
+    present = srv().mon["present"]
+    if ident in present:
+        present[ident]["name"] = name
+        return
+    present[ident] = {"name": name}
+    srv().mon_rt["missing"].pop(ident, None)
+    if record:
+        record_event("player_joined", ts, name=name, identity=ident)
+
+def _player_left(ident, ts, record=True, **extra):
+    rt = srv().mon_rt
+    player = srv().mon["present"].pop(ident, None)
+    rt["missing"].pop(ident, None)
+    rt["seen_in_stats"].discard(ident)
+    if player is None:
+        return
+    rt["left_at"][ident] = time.time()
+    if record:
+        record_event("player_left", ts, name=player.get("name", "?"), identity=ident, **extra)
+
+def _stats_players():
+    """identityId -> name from this server's stats file, or None when the file
+    can't be trusted right now (missing, half-written, out of date, the server
+    is off, or another running server writes the same file)."""
+    if get_server_pid() is None:
+        return None
+    other = other_server()
+    if os.path.normcase(_stats_path()) == os.path.normcase(_stats_path(other)) and get_server_pid(other):
+        return None
+    stats, _path, _err = read_server_stats()
+    if not isinstance(stats, dict) or not isinstance(stats.get("connected_players"), dict):
+        return None
+    updated = stats.get("updated")
+    if isinstance(updated, (int, float)) and time.time() - updated > _STATS_MAX_AGE:
+        return None
+    return {str(k): str(v) for k, v in stats["connected_players"].items()}
+
+def _sync_stats_players():
+    players = _stats_players()
+    if players is None:
+        return
+    rt, present, now = srv().mon_rt, srv().mon["present"], time.time()
+    if not rt["seeded"]:
+        # First snapshot since the panel had no list (first run): take it as
+        # the starting point rather than reporting everyone as joining now.
+        for ident, name in players.items():
+            _player_joined(ident, name, now, record=False)
+        rt["seen_in_stats"].update(players)
+        rt["seeded"] = True
+        return
+    for ident, name in players.items():
+        if ident not in present and now - rt["left_at"].get(ident, 0) > _STATS_REJOIN_BLOCK:
+            _player_joined(ident, name, now)
+        if ident in present:
+            rt["seen_in_stats"].add(ident)
+            rt["missing"].pop(ident, None)
+    for ident in list(present):
+        # Only players the file has listed can go missing from it: someone the
+        # log just reported joining may not be in it yet.
+        if ident in players or ident not in rt["seen_in_stats"]:
+            continue
+        rt["missing"][ident] = rt["missing"].get(ident, 0) + 1
+        if rt["missing"][ident] >= _STATS_LEAVE_AFTER:
+            _player_left(ident, now)
 
 def _read_log(record):
     """Process complete lines after the saved offset in the current log."""
@@ -2028,6 +2120,9 @@ def _check_process():
         record_event("server_stopped", stopped,
                      detail=f"From the panel ({_ACTION_LABELS.get(action, action)})" if action
                      else "Outside the panel (crashed, or closed on the server)")
+        for ident in list(srv().mon["present"]):
+            _player_left(ident, stopped, reason="server stopped")
+        srv().mon["joined"] = {}
     if pid is not None:
         from_panel = abs(started - srv().last_launch["ts"]) < 20
         action = srv().last_launch["action"]
@@ -2063,6 +2158,9 @@ def _load_monitor_state():
             saved = json.load(f)
         if saved.get("path") and os.path.exists(saved["path"]):
             mon.update({k: saved[k] for k in mon if k in saved})
+            # With a saved player list, joins and leaves since then are real.
+            srv().mon_rt["seeded"] = "present" in saved
+            srv().mon_rt["seen_in_stats"] = set(mon["present"])
             # Recompute rather than trust the saved value, which may have been
             # worked out with an outdated time zone.
             mon["midnight"] = _log_day_start(mon["path"])[0]
@@ -2100,6 +2198,7 @@ def _monitor_loop():
             _current_server.set(server)
             try:
                 _follow_logs()
+                _sync_stats_players()
                 _check_process()
                 last_saved[server.num] = _save_monitor_state(last_saved.get(server.num))
             except Exception as e:

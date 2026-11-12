@@ -1037,7 +1037,7 @@ const TIMELINE_TAGS = {
 
 function timelineText(e) {
   if (e.type === 'player_joined') return `${escHtml(e.name)} joined`;
-  if (e.type === 'player_left')   return `${escHtml(e.name)} left`;
+  if (e.type === 'player_left')   return `${escHtml(e.name)} left${e.reason ? ` <span class="detail">— ${escHtml(e.reason)}</span>` : ''}`;
   const what = e.type === 'server_started' ? 'Server started' : 'Server stopped';
   return `${what} <span class="detail">— ${escHtml(e.detail || '')}</span>`;
 }
