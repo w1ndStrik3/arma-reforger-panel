@@ -1322,8 +1322,13 @@ _LIVE_LOG_SEED_BYTES = 4 * 1024 * 1024  # how far back a log is read the first t
 _live_log = {}  # path -> {"offset", "partial", "lines"}
 _live_log_lock = threading.Lock()
 
+# Other lines the server writes every second because of -logStats, e.g.
+#   19:28:05.564 WORLD        : UpdateEntities
+#   19:28:05.575  WORLD        : Frame
+_LIVE_LOG_HIDE_RE = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{3}\s+WORLD\s*:\s*(?:UpdateEntities|Frame)\s*$")
+
 def _live_log_keep(line):
-    return not _FPS_RE.search(line)
+    return not (_FPS_RE.search(line) or _LIVE_LOG_HIDE_RE.match(line))
 
 def recent_log_lines(path, n):
     """The last `n` lines of the log at `path`, without the FPS lines."""

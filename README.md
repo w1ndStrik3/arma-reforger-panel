@@ -22,7 +22,7 @@ A lightweight, self-hosted web panel for managing your **Arma Reforger dedicated
 - **Server timeline** — Players joining and leaving (with names) plus server starts and stops, timestamped; recorded in the background to `events.jsonl` even when nobody has the panel open. Joins and leaves come from the console log and from comparing the Server Admin Tools stats file's player list every second, so one source catches what the other misses
 - **Players online** — Who is on each server right now and for how long, plus a player count in the status bar
 - **Current status** — Everything in the Server Admin Tools mod's `serveradmintools_stats.json` (players, FPS, uptime, AI, vehicles, events…), refreshed live
-- **Live log streaming** — Server console logs with colour-coded output (errors, warnings, network events); the FPS line the server writes every second is left out (it feeds the FPS graph instead)
+- **Live log streaming** — Server console logs with colour-coded output (errors, warnings, network events); the stats lines the server writes every second (FPS, `WORLD : UpdateEntities`, `WORLD : Frame`) are left out; the FPS line feeds the FPS graph instead
 - **Mission selector** — Vanilla scenarios plus any found in installed mods; the selected scenario's resource name (e.g. `{0648CDB32D6B02B3}Missions/SP02_AirSupport.conf`) is shown under the dropdown
 - **Mod lists** — Keep several named mod lists, edit each as JSON, and pick one from a dropdown; the selected list is written into `config.json` every time the server starts
 - **Config editor** — Edit server name, scenario, passwords, max players, view/grass distances, third person and cross-faction voice without touching the filesystem
