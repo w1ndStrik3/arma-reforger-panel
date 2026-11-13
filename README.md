@@ -11,6 +11,7 @@ A lightweight, self-hosted web panel for managing your **Arma Reforger dedicated
 - **One-command install** — sets up SteamCMD, downloads the Arma Reforger server and installs the panel automatically
 - **Server control** — Start, stop, soft restart and hard restart your server from the browser
 - **Soft restart** — Save the game state, stop the server and bring it back up from that save
+- **One-click panel update** — An Update button runs `git pull` and restarts the panel, leaving the game servers running
 - **Back up after a reboot** — When the VPS restarts, the servers that were running before are started again
 - **Daily soft restart** — Every running server gets a soft restart at 04:00 Copenhagen time (`DAILY_RESTART_TIME` / `DAILY_RESTART_TZ` in config.env)
 - **Two servers** — Run a second server from the same installation with its own `config2.json`; a dropdown at the top switches the whole panel between Server 1 and Server 2
@@ -131,6 +132,8 @@ sudo bash install.sh --update
 ```
 
 This copies updated panel files and restarts the service. Your `config.env` is preserved.
+
+**Update button (Windows, or any install that runs from a git clone).** The small **⟳ Update** button next to the server dropdown does the update for you: the panel stops, runs `git pull` in its folder (and `pip install -r requirements.txt` if that file changed), then starts again in a new window, and the page reloads by itself. The game servers keep running throughout. If the pull fails, for example because a panel file was edited locally, the panel starts again on the old version and shows git's error. Hover over the button to see the current version.
 
 ---
 
@@ -265,6 +268,7 @@ To keep Caddy running after reboots, register it as a service with [NSSM](https:
 arma-reforger-panel/
 ├── app.py               # Flask backend — API, server control, metrics
 ├── win_ctrl_c.py        # Windows helper: sends Ctrl+C to the server console
+├── update_panel.py      # Update button helper: git pull, then start the panel again
 ├── requirements.txt     # Python dependencies (for pip / Windows)
 ├── modlists/            # Saved mod lists, one JSON file each (created at runtime)
 ├── index.html           # Main panel UI (English)

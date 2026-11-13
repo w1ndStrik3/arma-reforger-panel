@@ -116,6 +116,16 @@
     text-transform: uppercase; padding: 7px 10px; cursor: pointer; outline: none;
   }
   .server-select option { background: var(--surface); color: var(--text); }
+  .btn-update {
+    background: none; border: 1px solid var(--border); color: var(--muted);
+    font-family: 'Barlow Condensed', sans-serif; font-size: 11px; letter-spacing: 0.15em;
+    text-transform: uppercase; padding: 6px 9px; cursor: pointer; white-space: nowrap;
+    transition: border-color 0.2s, color 0.2s;
+  }
+  .btn-update:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .btn-update:disabled { cursor: default; opacity: 0.7; }
+  .btn-update.ok { color: var(--online); border-color: var(--online); }
+  .btn-update.error { color: var(--offline); border-color: var(--offline); }
 
   .card {
     background: var(--surface);
@@ -290,6 +300,10 @@
   .chart-value .down { color: var(--down-color); }
   .chart-value .up   { color: var(--up-color); }
   @media (max-width: 700px) { .charts-row { grid-template-columns: minmax(0, 1fr); } }
+  /* Phones: title on top, the header buttons in a row underneath. */
+  @media (max-width: 600px) {
+    header { flex-direction: column; align-items: flex-start; gap: 14px; }
+  }
 
   .chart-sub {
     font-size: 11px; color: var(--muted); margin-top: 2px; text-align: right;
@@ -530,6 +544,7 @@
         <option value="1">Server 1</option>
         <option value="2">Server 2</option>
       </select>
+      <button class="btn-update" id="btn-update" onclick="updatePanel()" title="Update the panel: stop it, run git pull and start it again. The game servers keep running.">⟳ Update</button>
       <a class="btn-logout" href="/mods" title="Installed mods, sizes and dependencies">Mods</a>
       <a class="btn-logout" href="/config" title="View and edit config.json">Config file</a>
       <button class="btn-logout" onclick="doLogout()">Logout ↗</button>
@@ -1098,7 +1113,7 @@ function timelineText(e) {
 let lastTimelineJson = null;
 async function fetchTimeline() {
   try {
-    const r = await fetch('/api/events?limit=300');
+    const r = await fetch('/api/events?limit=30');
     if (r.status === 401) { window.location.href = '/login'; return; }
     const d = await r.json();
     const json = JSON.stringify(d.events);
@@ -1222,28 +1237,35 @@ let refreshInterval = null;
 let countdown = 10;
 let busy = false;
 
-async function fetchStatus() {
+// fill: also put the server's values into the form fields (text boxes and
+// dropdowns). Only on page load and right after a save; the periodic refresh
+// never touches anything you can type in or pick from.
+async function fetchStatus(fill = false) {
   try {
     const r = await fetch('/api/status');
     if (r.status === 401) { window.location.href = '/login'; return; }
     const d = await r.json();
-    updateUI(d);
+    updateUI(d, fill);
   } catch(e) {
-    setLog('Connection error', 'error');
+    if (!panelUpdating) setLog('Connection error', 'error');
   }
 }
 
-// Server dropdown labels: which server is running, and whether config2.json exists.
+// Server dropdown labels: which server is running, and whether config2.json
+// exists. Changed only when a server's state changes, and never while the
+// dropdown is in use.
 function updateServerOptions(servers) {
   if (!servers) return;
   const sel = document.getElementById('server-select');
+  if (document.activeElement === sel) return;
   servers.forEach(x => {
     const opt = [...sel.options].find(o => o.value === String(x.num));
-    if (opt) opt.textContent = `${x.label} · ${!x.config_exists ? 'no config' : x.running ? 'online' : 'offline'}`;
+    const text = `${x.label} · ${!x.config_exists ? 'no config' : x.running ? 'online' : 'offline'}`;
+    if (opt && opt.textContent !== text) opt.textContent = text;
   });
 }
 
-function updateUI(d) {
+function updateUI(d, fill) {
   updateServerOptions(d.servers);
   const dot = document.getElementById('dot');
   const txt = document.getElementById('status-text');
@@ -1270,24 +1292,18 @@ function updateUI(d) {
 
   updateScheduleNote(d);
 
-  const nameInput = document.getElementById('input-name');
-  if (document.activeElement !== nameInput) nameInput.value = d.server_name || '';
-
-  const pwdInput = document.getElementById('input-password');
-  if (document.activeElement !== pwdInput) pwdInput.value = d.password || '';
-
-  const pwdAdminInput = document.getElementById('input-password-admin');
-  if (document.activeElement !== pwdAdminInput) pwdAdminInput.value = d.password_admin || '';
-
   if (d.csrf) CSRF = d.csrf;
-  if (d.settings && !settingsLoaded) fillSettings(d.settings);
+  if (!fill) return;
+  document.getElementById('input-name').value = d.server_name || '';
+  document.getElementById('input-password').value = d.password || '';
+  document.getElementById('input-password-admin').value = d.password_admin || '';
+  if (d.settings) fillSettings(d.settings);
   renderMissionSelect(d.missions || [], d.missions_count, d.scenario_id);
 }
 
 function renderMissionSelect(missions, counts, currentId) {
   const sel = document.getElementById('input-mission');
-  // Always rebuild — discovered scenarios can change as the workshop populates.
-  const prev = sel.value || currentId || '';
+  const prev = currentId || sel.value || '';
   sel.innerHTML = '';
   // Group by source: vanilla first, then per-mod alphabetical.
   const groups = {};
@@ -1546,9 +1562,8 @@ async function serverAction(action) {
 }
 
 // ─── Server settings + gameplay ───────────────────────────────────────────────
-// Filled once from /api/status (and again after a save), not on every poll,
+// Filled from /api/status on page load and after a save, not on every poll,
 // so a refresh never overwrites values someone is still editing.
-let settingsLoaded = false;
 
 function fillSettings(s) {
   document.getElementById('input-max-players').value      = s.max_players;
@@ -1557,7 +1572,6 @@ function fillSettings(s) {
   document.getElementById('input-grass-distance').value   = s.server_min_grass_distance;
   document.getElementById('input-third-person').value     = String(!!s.disable_third_person);
   document.getElementById('input-von-cross').value        = String(!!s.von_cross_faction);
-  settingsLoaded = true;
 }
 
 async function saveSettings(which) {
@@ -1581,8 +1595,7 @@ async function saveSettings(which) {
     if (d.ok) {
       setLog(`${label} saved`, 'ok');
       document.getElementById(notice).classList.toggle('visible', !!d.restart_required);
-      settingsLoaded = false;
-      await fetchStatus();
+      await fetchStatus(true);
     } else {
       setLog('Save failed: ' + (d.error || 'unknown'), 'error');
     }
@@ -1607,7 +1620,7 @@ async function saveConfig() {
     if (d.ok) {
       setLog('Configuration saved', 'ok');
       document.getElementById('restart-notice').classList.toggle('visible', !!d.restart_required);
-      await fetchStatus();
+      await fetchStatus(true);
     } else {
       setLog('Save failed: ' + (d.error || 'unknown'), 'error');
     }
@@ -1701,6 +1714,91 @@ async function doLogout() {
   window.location.href = '/login';
 }
 
+// ─── Panel update (git pull) ─────────────────────────────────────────────────
+let panelUpdating = false;
+
+function updateButton(text, cls, title) {
+  const btn = document.getElementById('btn-update');
+  btn.textContent = text;
+  btn.className = 'btn-update' + (cls ? ' ' + cls : '');
+  if (title) btn.title = title;
+}
+
+async function updatePanel() {
+  if (!confirm('Update the panel? It stops, runs git pull and starts again; this page reloads when it is back. The game servers keep running.')) return;
+  const btn = document.getElementById('btn-update');
+  btn.disabled = true;
+  updateButton('Updating…');
+  try {
+    const r = await postJson('/api/panel-update', {});
+    const d = await r.json();
+    if (!d.ok) {
+      btn.disabled = false;
+      updateButton('⟳ Update', 'error');
+      setLog('Panel update: ' + (d.error || 'unknown error'), 'error');
+      alert('The panel was not updated: ' + (d.error || 'unknown error'));
+      return;
+    }
+    panelUpdating = true;
+    setLog('Updating the panel: stopping, running git pull, starting again...', 'info');
+    // Wait for a panel that started after this request: the new one.
+    const deadline = Date.now() + 5 * 60 * 1000;
+    while (Date.now() < deadline) {
+      await new Promise(res => setTimeout(res, 2000));
+      try {
+        const rr = await fetch('/api/panel-update', { cache: 'no-store' });
+        if (rr.status === 401) { window.location.href = '/login'; return; }
+        if (!rr.ok) continue;
+        const info = await rr.json();
+        if (info.started !== d.started) { location.reload(); return; }
+      } catch (e) { /* down while it updates */ }
+    }
+    panelUpdating = false;
+    btn.disabled = false;
+    updateButton('⟳ Update', 'error');
+    setLog('The panel did not come back within 5 minutes. Check the panel window on the server.', 'error');
+  } catch (e) {
+    btn.disabled = false;
+    updateButton('⟳ Update', 'error');
+    setLog('Connection error', 'error');
+  }
+}
+
+// Current version in the button's tooltip, and the result of an update that
+// just finished (shown once, after the page reloads).
+async function showPanelVersion() {
+  try {
+    const r = await fetch('/api/panel-update');
+    if (!r.ok) return;
+    const d = await r.json();
+    const base = 'Update the panel: stop it, run git pull and start it again. The game servers keep running.';
+    document.getElementById('btn-update').title = base + (d.version ? `\nCurrent version: ${d.version}` : '');
+    const last = d.last;
+    if (!last || Date.now() / 1000 - last.ts > 600) return;
+    let shown = null;
+    try { shown = sessionStorage.getItem('panel-update-shown'); } catch (e) {}
+    if (shown === String(last.ts)) return;
+    try { sessionStorage.setItem('panel-update-shown', String(last.ts)); } catch (e) {}
+    let msg, cls;
+    if (!last.ok) {
+      msg = `Panel update failed (still on version ${last.after || last.before || '?'}): ${last.error || last.output || 'unknown error'}`;
+      cls = 'error';
+    } else if (last.before === last.after) {
+      msg = `Panel is already up to date (${last.after})`;
+      cls = 'ok';
+    } else {
+      const n = (last.commits || []).length;
+      msg = `Panel updated ${last.before} → ${last.after} (${n} commit${n === 1 ? '' : 's'}): ` + (last.commits || []).map(c => c.replace(/^\S+ /, '')).join(' · ');
+      cls = 'ok';
+    }
+    setLog(msg, cls === 'ok' ? 'ok' : 'error');
+    updateButton(cls === 'ok' ? (last.before === last.after ? '✓ Up to date' : '✓ Updated') : '✗ Update failed', cls,
+                 msg + (d.version ? `\nCurrent version: ${d.version}` : ''));
+    setTimeout(() => updateButton('⟳ Update', ''), 20000);
+    if (!last.ok) alert(`The panel update failed:\n\n${last.error || ''}\n\n${last.output || ''}`.trim());
+  } catch (e) {}
+}
+
 function startCountdown() {
   countdown = 10;
   document.getElementById('refresh-timer').textContent = countdown;
@@ -1712,7 +1810,7 @@ function startCountdown() {
   }, 1000);
 }
 
-fetchStatus().then(() => { fetchPersistence(); fetchModlists(); startCountdown(); });
+fetchStatus(true).then(() => { fetchPersistence(); fetchModlists(); startCountdown(); showPanelVersion(); });
 
 // PWA — register the service worker
 if ('serviceWorker' in navigator) {

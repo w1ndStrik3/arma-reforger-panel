@@ -429,8 +429,11 @@ async function load() {
   try {
     const r = await fetch('/api/mods/installed');
     if (r.status === 401) { window.location.href = '/login'; return; }
+    const first = DATA === null;
     DATA = await r.json();
-    renderFilter();
+    // The list filter is built once; the polling below (while workshop data
+    // comes in) only refreshes the table, never the dropdown.
+    if (first) renderFilter();
     render();
     const st = document.getElementById('ws-status');
     st.textContent = DATA.workshop_pending ? `Fetching workshop data for ${DATA.workshop_pending} mod${DATA.workshop_pending === 1 ? '' : 's'}…` : '';

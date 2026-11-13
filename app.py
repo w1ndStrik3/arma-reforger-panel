@@ -2793,6 +2793,94 @@ def api_mods_workshop_refresh():
     wanted = set(installed) | {d for g in installed for d in _all_dependencies(g, installed)}
     return jsonify({"ok": True, "workshop_pending": _ws_queue_stale(sorted(wanted), force=True)})
 
+# ─── PANEL UPDATE ────────────────────────────────────────────────────────────
+#
+# The Update button: the panel exits, update_panel.py (started as its own
+# process) runs git pull in the panel folder, installs requirements.txt if it
+# changed, and starts the panel again with the same command line. The game
+# servers keep running. Under systemd the pull runs here instead and systemd
+# restarts the panel (Restart=always). The outcome is kept in
+# .panel-update.json and shown by the page after it reloads.
+
+_PANEL_STARTED = time.time()
+_UPDATER = os.path.join(_BASE_DIR, "update_panel.py")
+_UPDATE_RESULT = os.path.join(_BASE_DIR, ".panel-update.json")
+_update_lock = threading.Lock()
+_updating = False
+
+def _git_version():
+    try:
+        p = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=_BASE_DIR, capture_output=True,
+                           text=True, timeout=10, stdin=subprocess.DEVNULL,
+                           **({"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WINDOWS else {}))
+        return p.stdout.strip() if p.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+def _exit_soon():
+    def bye():
+        time.sleep(1)  # let the response go out first
+        print("[panel] Exiting for the update", flush=True)
+        os._exit(0)
+    threading.Thread(target=bye, daemon=True).start()
+
+@app.route("/api/panel-update", methods=["GET"])
+def api_panel_update_info():
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    last = None
+    try:
+        with open(_UPDATE_RESULT, encoding="utf-8") as f:
+            last = json.load(f)
+    except (OSError, ValueError):
+        pass
+    return jsonify({"started": _PANEL_STARTED, "version": _git_version(), "last": last})
+
+@app.route("/api/panel-update", methods=["POST"])
+def api_panel_update():
+    global _updating
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    err = _csrf_required()
+    if err: return err
+    if not shutil.which("git"):
+        return jsonify({"ok": False, "error": "git isn't installed or isn't on PATH"})
+    if not _git_version():
+        return jsonify({"ok": False, "error": f"{_BASE_DIR} isn't a git checkout, so it can't be updated with git pull"})
+    busy = [f"{x.label} ({_ACTION_LABELS.get(x.lifecycle['action'], x.lifecycle['action']).lower()})"
+            for x in SERVERS.values() if x.lifecycle["action"]]
+    if busy:
+        return jsonify({"ok": False, "error": f"Wait for {', '.join(busy)} to finish first"})
+    with _update_lock:
+        if _updating:
+            return jsonify({"ok": False, "error": "An update is already running"})
+        _updating = True
+    try:
+        if not IS_WINDOWS and os.environ.get("INVOCATION_ID"):
+            # A systemd service: a helper would be stopped along with the
+            # panel, so pull here; systemd starts the panel again.
+            def pull_then_exit():
+                sys.path.insert(0, _BASE_DIR)
+                import update_panel
+                update_panel.run_update()
+                _exit_soon()
+            threading.Thread(target=pull_then_exit, daemon=True).start()
+        else:
+            cmd = [sys.executable] + [os.path.abspath(sys.argv[0])] + sys.argv[1:]
+            args = [sys.executable, _UPDATER, str(os.getpid()), PANEL_HOST, str(PANEL_PORT), os.getcwd(), json.dumps(cmd)]
+            if IS_WINDOWS:
+                subprocess.Popen(args, cwd=_BASE_DIR, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL,
+                                 creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+            else:
+                subprocess.Popen(args, cwd=_BASE_DIR, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+            _exit_soon()
+    except Exception as e:
+        _updating = False
+        return jsonify({"ok": False, "error": f"Could not start the update: {e}"})
+    return jsonify({"ok": True, "started": _PANEL_STARTED})
+
 if __name__ == "__main__":
     start_monitor()
     app.run(host=PANEL_HOST, port=PANEL_PORT, threaded=True)
