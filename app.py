@@ -110,10 +110,10 @@ _CTRL_C_HELPER = os.path.join(_BASE_DIR, "win_ctrl_c.py")
 # has its own config file (config2.json next to config.json, or
 # SERVER2_CONFIG) and its own profile folder (SERVER2_PROFILE), passed as
 # -profile: per Bohemia's Startup Parameters page, -profile X keeps the
-# profile (saves, the stats file) in X/profile and logs in X/logs. So that it
-# doesn't download every mod a second time into its profile, it also gets
-# -addonDownloadDir pointing at the folder that holds server 1's "addons"
-# folder (downloads go to <that folder>/addons).
+# profile (saves, the stats file) in X/profile and logs in X/logs. Its mods
+# are its own too: it gets -addonDownloadDir X as well (downloads go to
+# <that folder>/addons), so it downloads into X/addons and never touches
+# server 1's addons folder (WORKSHOP_DIR).
 # Running servers are told apart by the -config path on their command line,
 # and logs by the -config path on their CLI Params line (which also keeps
 # them apart if both ever share a logs folder).
@@ -126,17 +126,18 @@ SERVER2_CONFIG = _cfg.get("SERVER2_CONFIG", os.path.join(os.path.dirname(SERVER_
 _PROFILE_ROOT_1 = os.path.dirname(PROFILE_DIR.rstrip("/\\"))
 SERVER2_PROFILE = _cfg.get("SERVER2_PROFILE", "").strip() or \
     os.path.join(os.path.dirname(_PROFILE_ROOT_1), os.path.basename(_PROFILE_ROOT_1) + "-Server2")
-# -addonDownloadDir X downloads into X/addons, so X is the folder that holds
-# server 1's addons folder. SERVER2_ADDON_DOWNLOAD_DIR overrides it.
-ADDON_DOWNLOAD_DIR = _cfg.get("SERVER2_ADDON_DOWNLOAD_DIR", "").strip() or (
-    os.path.dirname(WORKSHOP_DIR.rstrip("/\\"))
-    if os.path.basename(WORKSHOP_DIR.rstrip("/\\")).lower() == "addons" else "")
-if not ADDON_DOWNLOAD_DIR:
-    print("[panel] WARNING: WORKSHOP_DIR doesn't end in an 'addons' folder, so server 2 can't be pointed "
-          "at server 1's mods; set SERVER2_ADDON_DOWNLOAD_DIR in config.env.", flush=True)
+# -addonDownloadDir X downloads into X/addons. Server 2's X is its profile
+# folder unless SERVER2_ADDON_DOWNLOAD_DIR says otherwise.
+SERVER2_ADDON_DOWNLOAD_DIR = _cfg.get("SERVER2_ADDON_DOWNLOAD_DIR", "").strip() or SERVER2_PROFILE
+_WORKSHOP_PARENT = os.path.dirname(WORKSHOP_DIR.rstrip("/\\"))
+if os.path.normcase(os.path.abspath(SERVER2_ADDON_DOWNLOAD_DIR.rstrip("/\\"))) == \
+        os.path.normcase(os.path.abspath(_WORKSHOP_PARENT)) and \
+        os.path.basename(WORKSHOP_DIR.rstrip("/\\")).lower() == "addons":
+    print("[panel] WARNING: SERVER2_ADDON_DOWNLOAD_DIR points at server 1's mods folder, so both servers "
+          "share their mods. Remove it from config.env to give server 2 its own.", flush=True)
 
 class Server:
-    def __init__(self, num, config, profile_root=None):
+    def __init__(self, num, config, profile_root=None, addon_download_dir=None):
         self.num = num
         self.label = f"Server {num}"
         self.config = config
@@ -146,8 +147,11 @@ class Server:
         self.profile_dir = os.path.join(profile_root, "profile") if profile_root else PROFILE_DIR
         self.log_dir = os.path.join(profile_root, "logs") if profile_root else LOG_DIR
         self.extra_args = ["-profile", profile_root] if profile_root else []
-        if profile_root and ADDON_DOWNLOAD_DIR:
-            self.extra_args += ["-addonDownloadDir", ADDON_DOWNLOAD_DIR]
+        # Where its workshop mods are: the default for server 1 (WORKSHOP_DIR),
+        # <addon_download_dir>/addons for a server started with -addonDownloadDir.
+        self.addons_dir = os.path.join(addon_download_dir, "addons") if addon_download_dir else WORKSHOP_DIR
+        if addon_download_dir:
+            self.extra_args += ["-addonDownloadDir", addon_download_dir]
         # Its psutil.Process is kept between calls: cpu_percent() measures
         # usage since the previous call on the same object.
         self.proc = None
@@ -171,7 +175,7 @@ class Server:
         self.monitor_state_file = os.path.join(
             _BASE_DIR, ".monitor-state.json" if num == 1 else f".monitor-state-{num}.json")
 
-SERVERS = {1: Server(1, SERVER_CONFIG), 2: Server(2, SERVER2_CONFIG, SERVER2_PROFILE)}
+SERVERS = {1: Server(1, SERVER_CONFIG), 2: Server(2, SERVER2_CONFIG, SERVER2_PROFILE, SERVER2_ADDON_DOWNLOAD_DIR)}
 _current_server = contextvars.ContextVar("current_server", default=SERVERS[1])
 
 def srv():
@@ -377,12 +381,15 @@ _SCENARIO_NAME_OVERRIDES = {
 # file if nothing changed.
 
 _SCENARIO_GAME_ID_RE = re.compile(r'^\{[0-9A-Fa-f]{16}\}.+\.conf$')
-_SCAN_CACHE_FILE = os.path.join(_BASE_DIR, ".scenario-cache.json")
+def _scan_cache_file():
+    # Each server has its own mods, so its own list of scenarios found in them.
+    n = srv().num
+    return os.path.join(_BASE_DIR, ".scenario-cache.json" if n == 1 else f".scenario-cache-{n}.json")
 
 
 def _scan_cache_load():
     try:
-        with open(_SCAN_CACHE_FILE, encoding="utf-8") as f:
+        with open(_scan_cache_file(), encoding="utf-8") as f:
             data = json.load(f)
         return data.get("mods", {}), data.get("mtimes", {})
     except (OSError, json.JSONDecodeError):
@@ -391,36 +398,40 @@ def _scan_cache_load():
 
 def _scan_cache_save(mods, mtimes):
     try:
-        with open(_SCAN_CACHE_FILE, "w", encoding="utf-8") as f:
+        with open(_scan_cache_file(), "w", encoding="utf-8") as f:
             json.dump({"mods": mods, "mtimes": mtimes, "saved_at": time.time()}, f)
     except OSError as e:
         print(f"[panel] WARNING: could not write scenario cache: {e}", flush=True)
 
 
 _SCAN_LOCK = threading.Lock()
-_LAST_SCAN_RESULT: dict = {"scenarios": [], "diag": None, "ts": 0.0}
+_LAST_SCAN_RESULTS = {}  # server num -> {"scenarios", "diag", "ts"}
 
 
 def _candidate_addon_roots():
-    """Locations to scan for addons. Each entry is (path, is_vanilla).
-    `is_vanilla=True` means anything found there is Bohemia-shipped game
-    content (the dedicated server's bundled addons), not a workshop mod."""
+    """Locations to scan for the current server's addons. Each entry is (path,
+    is_vanilla). `is_vanilla=True` means anything found there is
+    Bohemia-shipped game content (the dedicated server's bundled addons), not
+    a workshop mod. Server 2 downloads into its own folder, so only that one
+    is scanned for its workshop mods; server 1 also tries the usual default
+    locations."""
     home = os.path.dirname(SERVER_DIR.rstrip("/")) if SERVER_DIR else os.path.expanduser("~")
     if not home or home == "/":
         home = os.path.expanduser("~arma") if os.path.isdir("/home/arma") else os.path.expanduser("~")
 
     roots = []
     # Workshop mod dirs (downloaded via SteamCMD / the game)
-    if WORKSHOP_DIR:
-        roots.append((WORKSHOP_DIR, False))
-    if IS_WINDOWS:
-        roots.append((os.path.join(_WIN_GAME_HOME, "addons"), False))
-    roots.extend([
-        (os.path.join(home, ".local/share/Arma Reforger/profile/addons"), False),
-        (os.path.join(home, ".local/share/Arma Reforger/addons"),         False),
-        (os.path.join(home, ".config/Arma Reforger/addons"),              False),
-        (os.path.join(home, ".config/ArmaReforger/addons"),               False),
-    ])
+    if srv().addons_dir:
+        roots.append((srv().addons_dir, False))
+    if srv().num == 1:
+        if IS_WINDOWS:
+            roots.append((os.path.join(_WIN_GAME_HOME, "addons"), False))
+        roots.extend([
+            (os.path.join(home, ".local/share/Arma Reforger/profile/addons"), False),
+            (os.path.join(home, ".local/share/Arma Reforger/addons"),         False),
+            (os.path.join(home, ".config/Arma Reforger/addons"),              False),
+            (os.path.join(home, ".config/ArmaReforger/addons"),               False),
+        ])
     # Bohemia-shipped game content (Conflict, GM, CAH, Operation Omega, etc.)
     if SERVER_DIR:
         roots.extend([
@@ -685,12 +696,11 @@ def discover_mod_scenarios(force_rescan=False):
 
     if not _SCAN_LOCK.acquire(blocking=force_rescan):
         # Scan in progress and we don't want to block — return whatever we have.
-        return _LAST_SCAN_RESULT["scenarios"], (_LAST_SCAN_RESULT["diag"] or {"busy": True})
+        last = _LAST_SCAN_RESULTS.get(srv().num) or {}
+        return last.get("scenarios", []), (last.get("diag") or {"busy": True})
     try:
         scenarios, diag = _discover_locked(force_rescan)
-        _LAST_SCAN_RESULT["scenarios"] = scenarios
-        _LAST_SCAN_RESULT["diag"] = diag
-        _LAST_SCAN_RESULT["ts"] = time.time()
+        _LAST_SCAN_RESULTS[srv().num] = {"scenarios": scenarios, "diag": diag, "ts": time.time()}
         return scenarios, diag
     finally:
         _SCAN_LOCK.release()
@@ -719,8 +729,28 @@ def all_scenarios(force_rescan=False):
     return out, diag
 
 
+_first_scan_started = set()
+
+def _ensure_scenario_cache():
+    """A server with no scenario cache yet (e.g. server 2 after it got its own
+    mods folder) gets one scan in the background; its mods' scenarios show up
+    in the dropdown on the next page load."""
+    s = srv()
+    if s.num in _first_scan_started or os.path.exists(_scan_cache_file()):
+        return
+    _first_scan_started.add(s.num)
+    def scan():
+        _current_server.set(s)
+        try:
+            discover_mod_scenarios(force_rescan=True)
+        except Exception as e:
+            print(f"[panel] scenario scan for {s.label} failed: {e}", flush=True)
+    threading.Thread(target=scan, daemon=True).start()
+
+
 def all_scenarios_cached():
     """Like all_scenarios() but never scans — used by /api/status hot path."""
+    _ensure_scenario_cache()
     by_id = {}
     for s in AVAILABLE_MISSIONS:
         by_id[s["id"]] = dict(s)
@@ -2777,7 +2807,8 @@ def api_mods_installed():
             lists[name] = [str(x.get("modId", "")).upper() for x in load_modlist(name)]
         except (OSError, ValueError):
             pass
-    return jsonify({"ok": True, "mods": mods, "names": names, "modlists": lists,
+    return jsonify({"ok": True, "server": srv().num, "addons_dir": srv().addons_dir,
+                    "mods": mods, "names": names, "modlists": lists,
                     "selected": get_selected_modlist(),
                     "selected_by": {x.label: get_selected_modlist(x) for x in SERVERS.values()},
                     "workshop_pending": pending,

@@ -14,3 +14,4 @@ events.jsonl
 .monitor-state-*.json
 .panel-update.json
 panel-output.log
+.scenario-cache-*.json
