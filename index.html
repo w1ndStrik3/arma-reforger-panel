@@ -1367,6 +1367,17 @@ function renderMissionSelect(missions, counts, currentId) {
     });
     sel.appendChild(og);
   });
+  // A scenario set in config.json that no installed mod lists (e.g. typed
+  // into the file by hand) still shows, so saving doesn't replace it.
+  if (prev && !missions.some(m => m.id === prev)) {
+    const og = document.createElement('optgroup');
+    og.label = 'In config.json, not found in the installed mods';
+    const opt = document.createElement('option');
+    opt.value = prev;
+    opt.textContent = prev.replace(/^\{[0-9A-Fa-f]+\}/, '').split('/').pop().replace(/\.conf$/i, '');
+    og.appendChild(opt);
+    sel.insertBefore(og, sel.firstChild);
+  }
   if (prev) sel.value = prev;
   showMissionId();
 

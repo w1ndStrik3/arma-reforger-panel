@@ -388,10 +388,15 @@ def _scan_cache_file():
     return os.path.join(_BASE_DIR, ".scenario-cache.json" if n == 1 else f".scenario-cache-{n}.json")
 
 
+# Bumped when the scan finds things differently, so old caches are redone.
+_SCAN_CACHE_VERSION = 2
+
 def _scan_cache_load():
     try:
         with open(_scan_cache_file(), encoding="utf-8") as f:
             data = json.load(f)
+        if data.get("version") != _SCAN_CACHE_VERSION:
+            return {}, {}
         return data.get("mods", {}), data.get("mtimes", {})
     except (OSError, json.JSONDecodeError):
         return {}, {}
@@ -400,7 +405,7 @@ def _scan_cache_load():
 def _scan_cache_save(mods, mtimes):
     try:
         with open(_scan_cache_file(), "w", encoding="utf-8") as f:
-            json.dump({"mods": mods, "mtimes": mtimes, "saved_at": time.time()}, f)
+            json.dump({"version": _SCAN_CACHE_VERSION, "mods": mods, "mtimes": mtimes, "saved_at": time.time()}, f)
     except OSError as e:
         print(f"[panel] WARNING: could not write scenario cache: {e}", flush=True)
 
@@ -484,7 +489,10 @@ def _addon_name_from_gproj(addon_dir):
     return m.group(1).strip() if m else None
 
 
-_RDB_PATH_RE = re.compile(rb'Missions/[A-Za-z0-9_./\-]+\.conf')
+# A .conf inside a Missions folder, at the top of the addon or deeper (e.g.
+# Worlds/MyMap/Missions/Conflict.conf). The record check below confirms the
+# match is a whole path.
+_RDB_PATH_RE = re.compile(rb'(?:[A-Za-z0-9_.\-]+/)*Missions/[A-Za-z0-9_./\-]+\.conf')
 
 def _scenarios_from_rdb(rdb_path, source_label):
     """Fallback: parse `resourceDatabase.rdb` for scenario records.
@@ -636,14 +644,16 @@ def _discover_locked(force_rescan):
             #    display names + player counts when populated).
             if meta_path:
                 scenarios, mod_name = _scenarios_from_meta(meta_path)
-            # 2. Fall back to the .rdb scan when the meta has no scenarios
-            #    (Linux dedi strips them) or when there's no meta at all
+            # 2. Add what the .rdb lists: the meta may have no scenarios
+            #    (the dedicated server's downloader often strips them), only
+            #    some of them (e.g. an older version's), or not exist at all
             #    (Bohemia's bundled vanilla addons).
-            if not scenarios and rdb_path:
+            if rdb_path:
                 if not mod_name:
                     mod_name = _addon_name_from_gproj(addon_dir) or os.path.basename(addon_dir)
                 source = "vanilla" if is_vanilla else mod_name
-                scenarios = _scenarios_from_rdb(rdb_path, source)
+                known = {x["id"].upper() for x in scenarios}
+                scenarios += [x for x in _scenarios_from_rdb(rdb_path, source) if x["id"].upper() not in known]
             # 3. Force-tag everything found in the server install dir as vanilla.
             if is_vanilla:
                 for s in scenarios:
@@ -1409,6 +1419,9 @@ def api_config():
     if "scenario_id" in data:
         sid = data["scenario_id"].strip()
         valid_ids = {m["id"] for m in all_scenarios_cached()}
+        # The scenario already in config.json stays allowed even when no
+        # installed mod lists it (e.g. typed into the file by hand).
+        valid_ids.add(cfg.get("game", {}).get("scenarioId", ""))
         if sid not in valid_ids:
             return jsonify({"ok": False, "error": "Unknown scenario"})
         cfg.setdefault("game", {})["scenarioId"] = sid; changed = True
