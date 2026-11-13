@@ -13,6 +13,8 @@ A lightweight, self-hosted web panel for managing your **Arma Reforger dedicated
 - **Soft restart** — Save the game state, stop the server and bring it back up from that save
 - **One-click panel update** — An Update button runs `git pull` and restarts the panel, leaving the game servers running
 - **Back up after a reboot** — When the VPS restarts, the servers that were running before are started again
+- **Add mods by link** — Paste a workshop link or mod ID and the mod is added, with its workshop name, to the selected mod list
+- **Mod list backups** — Every day at 04:00 Copenhagen time all mod lists are copied to `modlist-backups/<date>/` (`MODLIST_BACKUP_TIME` / `MODLIST_BACKUP_TZ` / `MODLIST_BACKUP_DIR` in config.env)
 - **Daily soft restart** — Every running server gets a soft restart at 04:00 Copenhagen time (`DAILY_RESTART_TIME` / `DAILY_RESTART_TZ` in config.env)
 - **Two servers** — Run a second server from the same installation with its own `config2.json`; a dropdown at the top switches the whole panel between Server 1 and Server 2
 - **Linux and Windows** — Runs on Ubuntu (with the installer) or on Windows Server (manual setup)
@@ -166,6 +168,10 @@ SHUTDOWN_TIMEOUT=180
 # Daily soft restart of every running server (HH:MM; "off" turns it off)
 DAILY_RESTART_TIME=04:00
 DAILY_RESTART_TZ=Europe/Copenhagen
+
+# Daily backup of all mod lists to modlist-backups/<date>/ ("off" turns it off)
+MODLIST_BACKUP_TIME=04:00
+MODLIST_BACKUP_TZ=Europe/Copenhagen
 
 # Server Admin Tools stats file (defaults to <PROFILE_DIR>/serveradmintools_stats.json)
 # STATS_FILE=

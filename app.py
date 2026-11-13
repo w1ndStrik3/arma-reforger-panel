@@ -25,6 +25,7 @@ import time
 import glob
 import calendar
 import contextvars
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -1645,7 +1646,8 @@ def apply_selected_modlist():
     write_config(cfg)
 
 def _modlists_response(**extra):
-    return jsonify({"ok": True, "lists": list_modlists(), "selected": get_selected_modlist(), **extra})
+    return jsonify({"ok": True, "lists": list_modlists(), "selected": get_selected_modlist(),
+                    "backup": modlist_backup_info(), **extra})
 
 @app.route("/api/modlists")
 def api_modlists():
@@ -1698,6 +1700,59 @@ def api_modlists_save():
             return jsonify({"ok": False, "error": str(e)})
     affects_server = get_selected_modlist() == name and get_server_pid() is not None
     return _modlists_response(name=name, count=len(mods), restart_required=affects_server)
+
+# A mod's 16-hex-digit ID, on its own or in a workshop link such as
+# https://reforger.armaplatform.com/workshop/595F2BF2F44836FB-RHS-StatusQuo
+_MOD_ID_IN_TEXT_RE = re.compile(r"(?<![0-9A-Za-z])([0-9A-Fa-f]{16})(?![0-9A-Za-z])")
+
+@app.route("/api/modlists/add-mod", methods=["POST"])
+def api_modlists_add_mod():
+    """Body: {input}: a workshop link or a mod ID. Adds the mod, named as on
+    its workshop page, to the mod list selected for this server."""
+    if not session.get("logged_in"):
+        return jsonify({"error": "unauthorized"}), 401
+    err = _csrf_required()
+    if err: return err
+    text = str((request.get_json(silent=True) or {}).get("input", "")).strip()
+    ids = list(dict.fromkeys(g.upper() for g in _MOD_ID_IN_TEXT_RE.findall(text)))
+    if not ids:
+        return jsonify({"ok": False, "error": "Enter a workshop link or a 16-character mod ID, e.g. 595F2BF2F44836FB"})
+    if len(ids) > 1:
+        return jsonify({"ok": False, "error": "That contains more than one mod ID; add one mod at a time"})
+    guid = ids[0]
+    name = get_selected_modlist()
+    if not name:
+        return jsonify({"ok": False, "error": "No mod list is selected; create one first"})
+    def existing_entry():
+        return next((m for m in load_modlist(name) if str(m.get("modId", "")).upper() == guid), None)
+    try:
+        found = existing_entry()
+    except (OSError, ValueError) as e:
+        return jsonify({"ok": False, "error": str(e)})
+    if found:
+        return jsonify({"ok": False, "error": f"{found.get('name') or guid} is already in {name}"})
+    entry = _ws_fetch(guid)  # the workshop page, for the mod's name
+    if "error" in entry and entry["error"] != "no such mod on the workshop":
+        time.sleep(1)
+        entry = _ws_fetch(guid)  # one retry for a dropped connection
+    if "error" in entry:
+        return jsonify({"ok": False, "error": f"Could not get mod {guid} from the workshop: {entry['error']}"})
+    mod_name = str(entry["data"].get("name") or "").strip()
+    if not mod_name:
+        return jsonify({"ok": False, "error": f"The workshop page of mod {guid} has no name"})
+    with _MODLIST_LOCK:
+        try:
+            if existing_entry():  # added meanwhile
+                return jsonify({"ok": False, "error": f"{mod_name} is already in {name}"})
+            mods = load_modlist(name)
+            mods.append({"modId": guid, "name": mod_name})
+            save_modlist(name, mods)
+        except (OSError, ValueError) as e:
+            return jsonify({"ok": False, "error": str(e)})
+    affects_server = get_server_pid() is not None
+    return _modlists_response(name=name, added={"modId": guid, "name": mod_name,
+                                                "version": entry["data"].get("version")},
+                              count=len(mods), restart_required=affects_server)
 
 @app.route("/api/modlists/select", methods=["POST"])
 def api_modlists_select():
@@ -1865,16 +1920,17 @@ def api_soft_restart():
 _DAILY_RESTART_GRACE = 600
 _daily_restart = {"done": None}  # the scheduled moment last handled (epoch seconds)
 
-def _parse_daily_restart_time(text):
+def _parse_hhmm(text, setting, what):
+    """(hour, minute) from "HH:MM", or None for blank/"off" or a bad value."""
     if not text or text.lower() in ("off", "no", "false", "0", "none"):
         return None
     m = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
     if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
-        print(f"[panel] DAILY_RESTART_TIME={text!r} isn't HH:MM; the daily soft restart is off", flush=True)
+        print(f"[panel] {setting}={text!r} isn't HH:MM; {what} is off", flush=True)
         return None
     return int(m.group(1)), int(m.group(2))
 
-_DAILY_RESTART_HM = _parse_daily_restart_time(DAILY_RESTART_TIME)
+_DAILY_RESTART_HM = _parse_hhmm(DAILY_RESTART_TIME, "DAILY_RESTART_TIME", "the daily soft restart")
 
 # Zones on Central European Time, which the built-in rule below covers when
 # Python has no time zone database (Windows without the tzdata package).
@@ -1895,12 +1951,13 @@ def _cet_offset(utc_ts):
     summer = _last_sunday_1am_utc(year, 3) <= utc_ts < _last_sunday_1am_utc(year, 10)
     return 7200 if summer else 3600
 
-def _make_daily_restart_clock():
-    """(local_date(ts) -> (y, m, d), to_ts(y, m, d, hh, mm) -> epoch) for DAILY_RESTART_TZ."""
+def _make_clock(tzname):
+    """(local_date(ts) -> (y, m, d), to_ts(y, m, d, hh, mm) -> epoch) for the
+    time zone `tzname`."""
     import datetime
     try:
         from zoneinfo import ZoneInfo
-        tz = ZoneInfo(DAILY_RESTART_TZ)
+        tz = ZoneInfo(tzname)
         def local_date(ts):
             d = datetime.datetime.fromtimestamp(ts, tz)
             return d.year, d.month, d.day
@@ -1909,7 +1966,7 @@ def _make_daily_restart_clock():
         return local_date, to_ts
     except Exception:
         pass
-    if DAILY_RESTART_TZ in _CET_ZONES:
+    if tzname in _CET_ZONES:
         def local_date(ts):
             t = time.gmtime(ts + _cet_offset(ts))
             return t.tm_year, t.tm_mon, t.tm_mday
@@ -1917,8 +1974,8 @@ def _make_daily_restart_clock():
             naive = calendar.timegm((y, mo, d, hh, mm, 0))
             return naive - _cet_offset(naive - 3600)
         return local_date, to_ts
-    print(f"[panel] Unknown time zone {DAILY_RESTART_TZ!r} (on Windows, pip install tzdata); "
-          f"the daily soft restart uses this machine's local time", flush=True)
+    print(f"[panel] Unknown time zone {tzname!r} (on Windows, pip install tzdata); "
+          f"using this machine's local time instead", flush=True)
     def local_date(ts):
         t = time.localtime(ts)
         return t.tm_year, t.tm_mon, t.tm_mday
@@ -1926,18 +1983,21 @@ def _make_daily_restart_clock():
         return time.mktime((y, mo, d, hh, mm, 0, 0, 0, -1))
     return local_date, to_ts
 
-_daily_clock = _make_daily_restart_clock() if _DAILY_RESTART_HM else None
+_daily_clock = _make_clock(DAILY_RESTART_TZ) if _DAILY_RESTART_HM else None
 
-def _daily_restart_moments(now):
-    """(the last scheduled moment at or before now, the next one after it)."""
+def _daily_moments(clock, hm, now):
+    """(the last moment at or before now that a clock showed hm, the next one)."""
     import datetime
-    local_date, to_ts = _daily_clock
+    local_date, to_ts = clock
     y, mo, d = local_date(now)
     base = datetime.date(y, mo, d)
-    moments = sorted(to_ts(x.year, x.month, x.day, *_DAILY_RESTART_HM)
+    moments = sorted(to_ts(x.year, x.month, x.day, *hm)
                      for x in (base + datetime.timedelta(days=k) for k in (-1, 0, 1)))
     last = max(t for t in moments if t <= now)
     return last, min(t for t in moments if t > now)
+
+def _daily_restart_moments(now):
+    return _daily_moments(_daily_clock, _DAILY_RESTART_HM, now)
 
 def daily_restart_info():
     if not _daily_clock:
@@ -1976,6 +2036,53 @@ def _check_daily_restart():
         return  # the panel wasn't running at the time
     for server in SERVERS.values():
         _start_daily_restart(server)
+
+# ─── DAILY MOD LIST BACKUP ───────────────────────────────────────────────────
+#
+# Every day at MODLIST_BACKUP_TIME (in MODLIST_BACKUP_TZ; 04:00 Copenhagen
+# time by default) all mod lists are copied to
+# MODLIST_BACKUP_DIR/<date>/<list>.json, one folder per day. The folder is
+# named after the day of that 04:00. If the panel was off at the time, the
+# backup is made as soon as it runs again. Old backups are kept.
+
+MODLIST_BACKUP_DIR = _cfg.get("MODLIST_BACKUP_DIR", "").strip() or os.path.join(_BASE_DIR, "modlist-backups")
+_MODLIST_BACKUP_HM = _parse_hhmm(_cfg.get("MODLIST_BACKUP_TIME", "04:00").strip(),
+                                 "MODLIST_BACKUP_TIME", "the daily mod list backup")
+_MODLIST_BACKUP_TZ = _cfg.get("MODLIST_BACKUP_TZ", "").strip() or "Europe/Copenhagen"
+_backup_clock = _make_clock(_MODLIST_BACKUP_TZ) if _MODLIST_BACKUP_HM else None
+_modlist_backup = {"done": None}
+
+def backup_modlists(moment):
+    """Copy every mod list into a folder named after `moment`'s date."""
+    y, mo, d = _backup_clock[0](moment)
+    folder = os.path.join(MODLIST_BACKUP_DIR, "%04d-%02d-%02d" % (y, mo, d))
+    os.makedirs(folder, exist_ok=True)
+    with _MODLIST_LOCK:
+        names = list_modlists()
+        for name in names:
+            shutil.copy2(_modlist_path(name), os.path.join(folder, name + ".json"))
+    print(f"[panel] Backed up {len(names)} mod list{'' if len(names) == 1 else 's'} to {folder}", flush=True)
+    return folder, len(names)
+
+def _check_modlist_backup():
+    if not _backup_clock:
+        return
+    moment = _daily_moments(_backup_clock, _MODLIST_BACKUP_HM, time.time())[0]
+    if _modlist_backup["done"] is None:
+        saved = _read_state().get("modlist_backup_done")
+        _modlist_backup["done"] = saved if isinstance(saved, (int, float)) else 0
+    if moment <= _modlist_backup["done"] or time.time() < _modlist_backup.get("retry_at", 0):
+        return
+    _modlist_backup["retry_at"] = time.time() + 300  # if it fails, try again in 5 minutes
+    backup_modlists(moment)
+    _modlist_backup["done"] = moment
+    _update_state("modlist_backup_done", moment)
+
+def modlist_backup_info():
+    if not _backup_clock:
+        return None
+    return {"time": "%02d:%02d" % _MODLIST_BACKUP_HM, "tz": _MODLIST_BACKUP_TZ, "dir": MODLIST_BACKUP_DIR,
+            "next": int(_daily_moments(_backup_clock, _MODLIST_BACKUP_HM, time.time())[1])}
 
 # ─── RELAUNCH AFTER A REBOOT ─────────────────────────────────────────────────
 #
@@ -2474,6 +2581,10 @@ def _monitor_loop():
             _reboot_relaunch_tick()
         except Exception as e:
             print(f"[panel] monitor error (schedule): {e}", flush=True)
+        try:
+            _check_modlist_backup()
+        except Exception as e:
+            print(f"[panel] mod list backup failed: {e}", flush=True)
         for server in SERVERS.values():
             _current_server.set(server)
             try:
@@ -2732,15 +2843,18 @@ def _ws_fetch(guid):
         with urllib.request.urlopen(req, timeout=20) as r:
             html = r.read().decode("utf-8", errors="replace")
         entry = {"fetched_at": time.time(), "data": _parse_workshop_page(html, guid)}
+    except urllib.error.HTTPError as e:
+        entry = {"fetched_at": time.time(), "error": "no such mod on the workshop" if e.code == 404 else str(e)[:300]}
     except Exception as e:
         entry = {"fetched_at": time.time(), "error": str(e)[:300]}
     with _ws_lock:
-        _ws_cache[guid] = entry
+        _ws_load_cache()[guid] = entry
         _ws_queued.discard(guid)
         try:
             _ws_save_cache()
         except OSError:
             pass
+    return entry
 
 def _ws_queue_stale(guids, force=False):
     """Fetch workshop pages that are missing or out of date, in the background."""

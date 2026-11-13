@@ -437,6 +437,11 @@
   #modlist-text:focus { border-color: var(--accent); }
   .modlist-hint { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.6; }
   .modlist-hint code { font-family: 'Roboto Mono', monospace; color: var(--text); }
+  .modlist-hint b { color: var(--accent); font-weight: 600; }
+  #addmod-input { flex: 1 1 260px; min-width: 0; font-family: 'Roboto Mono', monospace; font-size: 13px; }
+  .addmod-result { font-size: 12.5px; margin-top: 8px; min-height: 1em; overflow-wrap: anywhere; }
+  .addmod-result.ok { color: var(--online); }
+  .addmod-result.error { color: var(--offline); }
 
   .restart-notice {
     display: none; margin-top: 10px;
@@ -753,6 +758,21 @@
     </div>
   </div>
 
+  <!-- Add a mod to the selected mod list -->
+  <div class="card" style="animation-delay:0.17s">
+    <div class="card-label">Add Mod</div>
+    <form class="modlist-bar" onsubmit="addMod(); return false;">
+      <input id="addmod-input" class="field-input" type="text" autocomplete="off" spellcheck="false"
+             placeholder="Workshop link or mod ID, e.g. 595F2BF2F44836FB" aria-label="Workshop link or mod ID">
+      <button class="btn-save" id="btn-addmod" type="submit">Add</button>
+    </form>
+    <div class="modlist-hint" id="addmod-hint">
+      Paste a mod's workshop link (<code>https://reforger.armaplatform.com/workshop/…</code>) or its ID. The mod is added,
+      with its name from the workshop, to the mod list selected below: <b id="addmod-target">—</b>.
+    </div>
+    <div class="addmod-result" id="addmod-result"></div>
+  </div>
+
   <!-- Mod lists -->
   <div class="card" style="animation-delay:0.18s">
     <div class="card-label">Mod Lists</div>
@@ -769,6 +789,7 @@
     <div class="modlist-hint">
       The selected list replaces the <code>mods</code> array in config.json every time the server starts.
       Format: a JSON array of <code>{ "modId": "…", "name": "…", "version": "…" }</code>; only <code>modId</code> is required.
+      <span id="modlist-backup-note"></span>
     </div>
     <div class="restart-notice" id="mods-restart-notice">⚠ Mod changes will be applied after server restart</div>
   </div>
@@ -1407,14 +1428,59 @@ async function fetchModlists() {
     if (r.status === 401) { window.location.href = '/login'; return; }
     const d = await r.json();
     renderModlistSelect(d.lists, d.selected);
+    showBackupNote(d.backup);
     if (d.selected) {
       await loadModlist(d.selected);
     } else {
       modlistLoaded = null;
       modlistDirty = false;
       document.getElementById('modlist-text').value = '';
+      document.getElementById('addmod-target').textContent = 'none (create a list first)';
     }
   } catch(e) { setLog('Could not load mod lists', 'error'); }
+}
+
+function showBackupNote(b) {
+  document.getElementById('modlist-backup-note').innerHTML = b
+    ? `All lists are backed up every day at ${escHtml(b.time)} ${escHtml(b.tz.split('/').pop().replace(/_/g, ' '))} time to <code>${escHtml(b.dir)}</code>, one folder per day.`
+    : '';
+}
+
+// Add a mod (workshop link or ID) to the selected list; the server looks up
+// its name on the workshop page.
+async function addMod() {
+  const input = document.getElementById('addmod-input');
+  const out = document.getElementById('addmod-result');
+  const btn = document.getElementById('btn-addmod');
+  const text = input.value.trim();
+  if (!text) { input.focus(); return; }
+  if (!modlistLoaded) { out.className = 'addmod-result error'; out.textContent = 'No mod list is selected; create one first.'; return; }
+  if (modlistDirty && !confirm(`"${modlistLoaded}" has unsaved changes in the editor below. Discard them and add the mod?`)) return;
+  btn.disabled = true;
+  btn.textContent = 'Adding…';
+  out.className = 'addmod-result';
+  out.textContent = 'Looking up the mod on the workshop…';
+  try {
+    const r = await postJson('/api/modlists/add-mod', { input: text });
+    const d = await r.json();
+    if (!d.ok) {
+      out.className = 'addmod-result error';
+      out.textContent = d.error || 'unknown error';
+    } else {
+      const a = d.added;
+      out.className = 'addmod-result ok';
+      out.textContent = `Added ${a.name} (${a.modId}${a.version ? ', latest version ' + a.version : ''}) to ${d.name}.`;
+      setLog(`Added ${a.name} to mod list "${d.name}"`, 'ok');
+      input.value = '';
+      await loadModlist(d.name);
+      modlistNotice(d);
+    }
+  } catch (e) {
+    out.className = 'addmod-result error';
+    out.textContent = 'Connection error';
+  }
+  btn.disabled = false;
+  btn.textContent = 'Add';
 }
 
 async function loadModlist(name) {
@@ -1425,6 +1491,7 @@ async function loadModlist(name) {
   document.getElementById('modlist-text').value = d.text;
   modlistLoaded = d.name;
   modlistDirty = false;
+  document.getElementById('addmod-target').textContent = d.name;
 }
 
 async function selectModlist(name) {
