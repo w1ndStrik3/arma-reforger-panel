@@ -1309,9 +1309,47 @@ def api_logs():
     if not path:
         return jsonify({"lines": [], "path": None})
     try:
-        return jsonify({"lines": tail_lines(path, n), "path": path})
+        return jsonify({"lines": recent_log_lines(path, n), "path": path})
     except Exception as e:
         return jsonify({"lines": [], "error": str(e)})
+
+# The live log leaves out the FPS line the server writes every second
+# (-logStats; the FPS graph reads it). So that a quiet server, whose log is
+# mostly FPS lines, still shows its last real lines without re-reading the log
+# on every poll, the other lines of each log are kept here and only what was
+# added since the last poll is read.
+_LIVE_LOG_SEED_BYTES = 4 * 1024 * 1024  # how far back a log is read the first time
+_live_log = {}  # path -> {"offset", "partial", "lines"}
+_live_log_lock = threading.Lock()
+
+def _live_log_keep(line):
+    return not _FPS_RE.search(line)
+
+def recent_log_lines(path, n):
+    """The last `n` lines of the log at `path`, without the FPS lines."""
+    from collections import deque
+    with _live_log_lock:
+        size = os.path.getsize(path)
+        st = _live_log.get(path)
+        if st is None or size < st["offset"]:  # new, or rewritten from the start
+            if len(_live_log) > 8:
+                _live_log.clear()
+            start = max(0, size - _LIVE_LOG_SEED_BYTES)
+            st = _live_log[path] = {"offset": start, "partial": b"", "lines": deque(maxlen=5000),
+                                    "skip_first": start > 0}
+        if size > st["offset"]:
+            with open(path, "rb") as f:
+                f.seek(st["offset"])
+                data = st["partial"] + f.read(size - st["offset"])
+            st["offset"] = size
+            # A line still being written is kept back until it is complete.
+            complete, sep, st["partial"] = data.rpartition(b"\n")
+            raw = complete.split(b"\n") if sep else []
+            if raw and st.pop("skip_first", False):
+                raw = raw[1:]  # began mid-line
+            st["lines"].extend(l for l in (r.decode("utf-8", errors="replace").rstrip("\r") for r in raw)
+                               if _live_log_keep(l))
+        return list(st["lines"])[-n:]
 
 @app.route("/api/config", methods=["POST"])
 def api_config():
