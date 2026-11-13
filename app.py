@@ -389,7 +389,7 @@ def _scan_cache_file():
 
 
 # Bumped when the scan finds things differently, so old caches are redone.
-_SCAN_CACHE_VERSION = 2
+_SCAN_CACHE_VERSION = 3
 
 def _scan_cache_load():
     try:
@@ -489,10 +489,39 @@ def _addon_name_from_gproj(addon_dir):
     return m.group(1).strip() if m else None
 
 
-# A .conf inside a Missions folder, at the top of the addon or deeper (e.g.
-# Worlds/MyMap/Missions/Conflict.conf). The record check below confirms the
-# match is a whole path.
-_RDB_PATH_RE = re.compile(rb'(?:[A-Za-z0-9_.\-]+/)*Missions/[A-Za-z0-9_./\-]+\.conf')
+# Scenario paths are .conf files in the addon's Missions folder, or in a
+# map's (Worlds/MyMap/Missions/Conflict.conf); a Missions folder elsewhere
+# (e.g. Configs/Missions/Tasks) holds other configs. Names may
+# contain spaces and other characters (e.g. "Missions/ARCL Arland.conf"), so
+# a path is taken to run from the control byte before "Missions/" to the
+# null after it; the record check confirms it is a whole path. (A plain
+# search rather than a regex, which backtracks badly on long text runs.)
+_RDB_CTRL_RE = re.compile(rb'[\x00-\x1f]')
+
+def _rdb_mission_paths(data):
+    """(start, end) of each candidate scenario path in an .rdb's bytes."""
+    pos, last_start = 0, -1
+    while True:
+        i = data.find(b"Missions/", pos)
+        if i < 0:
+            return
+        pos = i + 1
+        end = data.find(b"\x00", i)
+        if end < 0:
+            return
+        start, floor = i, max(0, i - 1024)  # no real path is that long
+        while start > floor and data[start - 1] >= 0x20:
+            start -= 1
+        if start == floor and start > 0 and data[start - 1] >= 0x20:
+            continue
+        if start == last_start:
+            continue  # a second "Missions/" in the same path
+        last_start = start
+        path = data[start:end]
+        if not (path.startswith(b"Missions/") or (path.startswith(b"Worlds/") and b"/Missions/" in path)):
+            continue
+        if path.lower().endswith(b".conf") and not _RDB_CTRL_RE.search(data, i, end):
+            yield start, end
 
 def _scenarios_from_rdb(rdb_path, source_label):
     """Fallback: parse `resourceDatabase.rdb` for scenario records.
@@ -518,8 +547,7 @@ def _scenarios_from_rdb(rdb_path, source_label):
 
     out = []
     seen = set()
-    for m in _RDB_PATH_RE.finditer(data):
-        ps, pe = m.start(), m.end()
+    for ps, pe in _rdb_mission_paths(data):
         if ps < 4:
             continue
         path_len_field = int.from_bytes(data[ps - 4:ps], "little")
@@ -535,7 +563,7 @@ def _scenarios_from_rdb(rdb_path, source_label):
         if guid_bytes == b"\x00" * 8 or guid_bytes == b"\xff" * 8:
             continue
         guid_hex = guid_bytes[::-1].hex().upper()  # little-endian → big-endian display
-        path_str = m.group(0).decode("ascii", errors="replace")
+        path_str = data[ps:pe].decode("utf-8", errors="replace")
         sid = "{" + guid_hex + "}" + path_str
         if sid in seen:
             continue
