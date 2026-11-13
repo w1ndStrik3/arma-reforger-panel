@@ -455,9 +455,9 @@ def _find_addons(root, max_depth=4):
     if not root or not os.path.isdir(root):
         return
     root = os.path.abspath(root)
-    base_depth = root.rstrip("/").count("/")
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        depth = dirpath.rstrip("/").count("/") - base_depth
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
         if depth >= max_depth:
             dirnames[:] = []
         meta_file = os.path.join(dirpath, "meta") if "meta" in filenames else None
@@ -730,28 +730,63 @@ def all_scenarios(force_rescan=False):
     return out, diag
 
 
-_first_scan_started = set()
+# Mods change on disk without the panel doing anything (the server downloads
+# them when it starts), so a background thread keeps each server's scenario
+# list current: every _SCENARIO_WATCH_EVERY seconds it checks the server's
+# mods folders (each mod's meta and resourceDatabase.rdb modification times)
+# and rescans when something changed, and once when the panel starts. The
+# rescan only re-reads the mods that changed.
 
-def _ensure_scenario_cache():
-    """A server with no scenario cache yet (e.g. server 2 after it got its own
-    mods folder) gets one scan in the background; its mods' scenarios show up
-    in the dropdown on the next page load."""
-    s = srv()
-    if s.num in _first_scan_started or os.path.exists(_scan_cache_file()):
-        return
-    _first_scan_started.add(s.num)
-    def scan():
-        _current_server.set(s)
+_SCENARIO_WATCH_EVERY = 30
+_scenario_watch_fp = {}  # server num -> mods folder fingerprint at the last scan
+
+def _addons_fingerprint():
+    fp = []
+    for root, is_vanilla in _candidate_addon_roots():
+        if is_vanilla:
+            continue
         try:
-            discover_mod_scenarios(force_rescan=True)
-        except Exception as e:
-            print(f"[panel] scenario scan for {s.label} failed: {e}", flush=True)
-    threading.Thread(target=scan, daemon=True).start()
+            names = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for name in names:
+            for fn in ("meta", "resourceDatabase.rdb"):
+                try:
+                    st = os.stat(os.path.join(root, name, fn))
+                    fp.append((root, name, fn, st.st_mtime, st.st_size))
+                except OSError:
+                    pass
+    return hash(tuple(fp))
+
+def refresh_scenarios():
+    """Rescan the current server's mods, re-reading only those that changed."""
+    with _SCAN_LOCK:
+        scenarios, diag = _discover_locked(False)
+        _LAST_SCAN_RESULTS[srv().num] = {"scenarios": scenarios, "diag": diag, "ts": time.time()}
+    return scenarios, diag
+
+def _scenario_watch_loop():
+    while True:
+        for server in SERVERS.values():
+            _current_server.set(server)
+            try:
+                fp = _addons_fingerprint()
+                if _scenario_watch_fp.get(server.num) == fp:
+                    continue
+                before = {x["id"] for x in cached_scenarios()}
+                scenarios, _diag = refresh_scenarios()
+                _scenario_watch_fp[server.num] = fp
+                after = {x["id"] for x in scenarios}
+                if after != before:
+                    print(f"[panel] {server.label}: scenarios from mods now {len(after)} "
+                          f"({len(after - before)} new, {len(before - after)} gone)", flush=True)
+            except Exception as e:
+                print(f"[panel] scenario scan for {server.label} failed: {e}", flush=True)
+        time.sleep(_SCENARIO_WATCH_EVERY)
 
 
 def all_scenarios_cached():
     """Like all_scenarios() but never scans — used by /api/status hot path."""
-    _ensure_scenario_cache()
     by_id = {}
     for s in AVAILABLE_MISSIONS:
         by_id[s["id"]] = dict(s)
@@ -1277,6 +1312,10 @@ def api_scenarios_rescan():
     err = _csrf_required()
     if err: return err
     missions, diag = all_scenarios(force_rescan=True)
+    try:
+        _scenario_watch_fp[srv().num] = _addons_fingerprint()
+    except Exception:
+        pass
     return jsonify({
         "ok": True,
         "missions": missions,
@@ -2646,6 +2685,7 @@ def start_monitor():
             return
         _monitor_started = True
     threading.Thread(target=_monitor_loop, daemon=True, name="monitor").start()
+    threading.Thread(target=_scenario_watch_loop, daemon=True, name="scenario-watch").start()
 
 @app.before_request
 def _ensure_monitor():

@@ -402,6 +402,7 @@
     font-size: 10px; letter-spacing: 0.05em; color: var(--muted);
     font-family: 'Barlow', sans-serif; text-transform: none;
   }
+  .link-btn.accent { color: var(--accent); }
   .link-btn {
     background: transparent; border: none; padding: 0; cursor: pointer;
     font-family: 'Barlow Condensed', sans-serif; font-weight: 700;
@@ -691,6 +692,8 @@
         <label for="input-mission">Scenario / Mission</label>
         <div class="field-aux">
           <span id="scenario-source-badge"></span>
+          <button type="button" id="btn-scenarios-changed" class="link-btn accent" onclick="applyNewScenarios()" hidden
+                  title="The panel found a different set of scenarios in the installed mods">↻ Scenarios changed: update list</button>
           <button type="button" id="btn-rescan-scenarios" class="link-btn" onclick="rescanScenarios()">Rescan from mods</button>
         </div>
         <select id="input-mission" onchange="showMissionId()"></select>
@@ -1314,7 +1317,13 @@ function updateUI(d, fill) {
   updateScheduleNote(d);
 
   if (d.csrf) CSRF = d.csrf;
-  if (!fill) return;
+  if (!fill) {
+    // The dropdown isn't rebuilt by the refresh; offer to update it instead
+    // when the scenarios found in the mods have changed.
+    latestMissions = d;
+    document.getElementById('btn-scenarios-changed').hidden = missionKey(d.missions || []) === renderedMissionKey;
+    return;
+  }
   document.getElementById('input-name').value = d.server_name || '';
   document.getElementById('input-password').value = d.password || '';
   document.getElementById('input-password-admin').value = d.password_admin || '';
@@ -1322,7 +1331,17 @@ function updateUI(d, fill) {
   renderMissionSelect(d.missions || [], d.missions_count, d.scenario_id);
 }
 
+let renderedMissionKey = null;  // which scenarios the dropdown holds
+let latestMissions = null;      // the newest /api/status response
+const missionKey = missions => JSON.stringify(missions.map(m => [m.id, m.name, m.source]));
+
+function applyNewScenarios() {
+  if (latestMissions) renderMissionSelect(latestMissions.missions || [], latestMissions.missions_count);
+}
+
 function renderMissionSelect(missions, counts, currentId) {
+  renderedMissionKey = missionKey(missions);
+  document.getElementById('btn-scenarios-changed').hidden = true;
   const sel = document.getElementById('input-mission');
   const prev = currentId || sel.value || '';
   sel.innerHTML = '';
